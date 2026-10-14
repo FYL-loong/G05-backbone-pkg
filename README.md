@@ -27,56 +27,89 @@ G0.5 复现第二步 —— **backbone（VLA 全模型）微调**代码。从上
 
 ## 算力平台 runbook
 
+> **平台约束（实测）**：镜像只能用官方的、容器**每次任务都是全新的**、**没有交互式终端**。
+> 所以流程做成了「一条命令全自动跑完」，中间的 L3 权重加载门禁由 `start.sh` **自动判定**
+> （见 `verify_weight_load.sh` 的日志解析），不通过就停下、不会带着坏权重去训练。
+
+### 一条命令（全自动，无人值守）
+
+平台任务的「执行命令」框里填这一条 —— **不需要任何 MODE 参数**：
+
 ```bash
-# 0. 克隆 + 装环境（uv sync）
-git clone https://github.com/Zenith9320/G05-backbone-pkg && cd G05-backbone-pkg
-bash setup_env.sh
-source .venv/bin/activate
-
-# 1. 设 token + 输出目录
-export HF_TOKEN="hf_xxxxxxxx"                      # 读写权限 token
-export G05_OUTPUT_DIR=/workspace/output            # 见下方「输出目录」说明
-
-# 2. 下载权重 + 数据集（脚本自带字节数校验，能查出截断）
-bash download_weights.sh        # g05-base + processor + action_tokenizer_yam.pt + yam_stats.json
-bash download_dataset.sh        # 全部 10 个任务（data/yam/TASK-YAM-*_lerobot）
-#    只要单任务可加：ONLY_TASK=TASK-YAM-0006 bash download_dataset.sh
-
-# 3. 五级验证（逐级通过再正式训练）
-#    L1 配置组装（不加载权重、不需要 GPU 显存）
-bash scripts/run/finetune.sh 1 yam --dry-run --max_datasets 1
-#    L2 数据管线 + forward/backward（显式置空权重，秒级起，不验证权重加载）
-bash scripts/run/finetune.sh 1 yam --test --max_datasets 1 \
-    model.pretrained_ckpt=null model.max_steps=10
-#    L3 ★ 权重加载验证（这一级才有 11GB 加载）
-bash verify_weight_load.sh
-#    L4 单批过拟合（loss 应明显下降）
-bash scripts/run/finetune.sh 1 yam --overfit_batch 5 model.max_steps=500 \
-    logger.mode=offline
-#    L5 少量数据真实训练，确认存盘与上传通路
-bash scripts/run/finetune.sh 1 yam --max_datasets 1 model.max_steps=20 \
-    logger.mode=offline
-
-# 4. 正式训练（GPU 数按平台定；wandb 离线）
-nohup bash scripts/run/finetune.sh 8 yam logger.mode=offline \
-    > /workspace/train.stdout.log 2>&1 &
-echo "PID=$!"
-
-# 5. ★ 训练期间定期打这个（容器临时，产物必须落 HF）
-EXP_DIR=$G05_OUTPUT_DIR/yam/<exp> bash upload_checkpoints.sh
-#    先看会传什么：DRY_RUN=1 EXP_DIR=... bash upload_checkpoints.sh
-#    只传最后一个：MODE=last EXP_DIR=... bash upload_checkpoints.sh
-
-# 6. open-loop 评测（指向产出 ckpt）
-bash scripts/run/eval_open_loop.sh \
-  --ckpt_path $G05_OUTPUT_DIR/yam/<exp>/last.pt \
-  --task_config configs/task/yam.yaml
-
-# 7. 训练结束后的最终收尾上传
-EXP_DIR=$G05_OUTPUT_DIR/yam/<exp> bash upload_output.sh
+git clone https://github.com/FYL-loong/G05-backbone-pkg.git G05-backbone-pkg && \
+  cd G05-backbone-pkg && bash start.sh
 ```
 
-### 为什么 L2 和 L3 要分开
+环境变量（在平台任务里配）：
+
+| 变量 | 值 |
+|---|---|
+| `HF_TOKEN` | HF **读写** token（密钥注入，勿硬编码） |
+
+`bash start.sh`（等价 `MODE=all`）会依次自动执行：
+
+| 阶段 | 内容 | 失败行为 |
+|---|---|---|
+| setup | `uv sync` → 拉 11.5GB 权重（带字节校验）→ 拉 10 个任务数据集 → stats 自检 | 非零退出 |
+| L1 | `--dry-run` 配置组装 | 非零退出 |
+| L2 | `--test` 数据管线 + forward/backward（权重随机初始化） | 非零退出 |
+| **L3 ★** | **加载 11GB 权重跑 2 步**，脚本解析 `Loaded a/b` 与 `Missing (rand init)` | **不通过则非零退出，不进训练** |
+| L4 | 单批过拟合（`--overfit_batch 5`，loss 应明显下降） | 非零退出 |
+| train | 8 卡正式训练（后台） | — |
+| 守护上传 | 训练启动后自动拉起 `upload_checkpoints.sh MODE=watch`，每 10 分钟把新 checkpoint 推到 HF | — |
+
+**下载与安装步骤都带重试**（`download_weights.sh` / `download_dataset.sh` 各重试 3 次，间隔 60s），
+网络抖动不会让整个任务失败。
+
+### 只跑部分阶段（调试用）
+
+```bash
+MODE=setup  bash start.sh     # 只装环境 + 拉权重/数据 + 校验
+MODE=verify bash start.sh     # 只跑 L1/L2/L3/L4
+MODE=train  bash start.sh     # 只启动训练（环境/数据须已就绪）
+```
+
+### 可选环境变量
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `GPUS` | 自动探测 | 训练卡数（`NPROC_PER_NODE` → `MLP_WORKER_GPU` → `MLP_WORKER_NUM` → `nvidia-smi`） |
+| `G05_OUTPUT_DIR` | `/workspace/output` | 输出目录（容器内，靠 HF 落地） |
+| `SKIP_L4` | `0` | `=1` 跳过单批过拟合直接训练 |
+| `STRICT_L3` | `1` | `=0` 时 L3 无法判定也继续（**不推荐**） |
+| `AUTO_UPLOAD` | `1` | `=0` 关闭守护上传 |
+| `UPLOAD_INTERVAL` | `600` | 守护上传轮询秒数 |
+| `ONLY_TASK` | 空 | 设了就只拉单任务，如 `TASK-YAM-0006` |
+
+### 训练跑起来之后
+
+训练在后台，`start.sh` 会打印 exp 目录。容器销毁后一切丢失，**所以收尾要在同一容器内做**：
+
+```bash
+EXP=$(cat /workspace/exp_dir.txt)
+
+# 看训练进度
+tail -f /workspace/train.stdout.log
+# 看上传进度
+tail -f /workspace/upload_checkpoints.log
+
+# open-loop 评测（跑完再执行）
+bash scripts/run/eval_open_loop.sh \
+  --ckpt_path $EXP/last.pt --task_config configs/task/yam.yaml
+
+# 最终收尾上传
+EXP_DIR=$EXP bash upload_output.sh
+```
+
+手动上传 checkpoint（守护进程没起来时用）：
+
+```bash
+EXP_DIR=$EXP bash upload_checkpoints.sh            # 传全部
+DRY_RUN=1 EXP_DIR=$EXP bash upload_checkpoints.sh  # 先看会传什么
+MODE=last EXP_DIR=$EXP bash upload_checkpoints.sh  # 只传最后一个
+```
+
+### 为什么 L2 和 L3 必须分开
 
 L2 用 `model.pretrained_ckpt=null`，会让 `scripts/finetune.py` 走
 `else: model = instantiate(cfg.model.model_arch)`（finetune.py:572-573）

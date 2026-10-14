@@ -31,6 +31,9 @@ STEPS="${STEPS:-2}"
 TASK="${TASK:-yam}"
 CKPT="${CKPT:-checkpoints/g05-base/checkpoints/model_state_dict.pt}"
 LOG="${LOG:-}"
+# STRICT=1（默认）：加载不完整就非零退出，供无人值守流程判断
+# STRICT=0：只报告，退出码始终为 0
+STRICT="${STRICT:-1}"
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_ROOT"
@@ -38,6 +41,8 @@ cd "$PROJECT_ROOT"
 # ---- 前置检查 ------------------------------------------------------------
 fail() { printf '\033[31m[FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
 info() { printf '\033[36m[INFO]\033[0m %s\n' "$*"; }
+ok()   { printf '\033[32m[ OK ]\033[0m %s\n' "$*"; }
+warn() { printf '\033[33m[WARN]\033[0m %s\n' "$*"; }
 
 [[ -f "$CKPT" ]] || fail "找不到权重 $CKPT —— 先跑 bash download_weights.sh"
 
@@ -73,22 +78,16 @@ trap 'rm -f "$BEFORE" "$AFTER"' EXIT
 find "$G05_OUTPUT_DIR" -maxdepth 3 -type d 2>/dev/null | sort > "$BEFORE"
 
 # ---- 跑 2 步（显式加载权重）----------------------------------------------
-info "开始：加载权重 + 跑 $STEPS 步"
+# 输出同时进 tee 和一个固定路径的日志，便于之后自动解析
+RUNLOG="${LOG:-$(pwd)/verify_weight_load.log}"
+info "开始：加载权重 + 跑 $STEPS 步（日志 -> $RUNLOG）"
 echo "--------------------------------------------------------------"
 set +e
-if [[ -n "$LOG" ]]; then
-    bash scripts/run/finetune.sh "$GPUS" "$TASK" \
-        --test --max_datasets 1 \
-        "model.pretrained_ckpt=$CKPT" \
-        "model.max_steps=$STEPS" 2>&1 | tee "$LOG"
-    rc="${PIPESTATUS[0]}"
-else
-    bash scripts/run/finetune.sh "$GPUS" "$TASK" \
-        --test --max_datasets 1 \
-        "model.pretrained_ckpt=$CKPT" \
-        "model.max_steps=$STEPS"
-    rc=$?
-fi
+bash scripts/run/finetune.sh "$GPUS" "$TASK" \
+    --test --max_datasets 1 \
+    "model.pretrained_ckpt=$CKPT" \
+    "model.max_steps=$STEPS" 2>&1 | tee "$RUNLOG"
+rc="${PIPESTATUS[0]}"
 set -e
 echo "--------------------------------------------------------------"
 
@@ -96,48 +95,108 @@ echo "--------------------------------------------------------------"
 find "$G05_OUTPUT_DIR" -maxdepth 3 -type d 2>/dev/null | sort > "$AFTER"
 NEWDIRS="$(comm -13 "$BEFORE" "$AFTER" || true)"
 RUN_DIR="$(printf '%s\n' "$NEWDIRS" | grep -v '^$' | tail -1 || true)"
+if [[ -n "$RUN_DIR" && -d "$RUN_DIR" && -f "$RUN_DIR/train.log" ]]; then
+    # train.log 更完整（tee 的 stdout 可能被 hydra 重定向过）
+    cp -f "$RUN_DIR/train.log" "$RUNLOG" 2>/dev/null || true
+fi
 
 echo
 printf '=%.0s' {1..62}; echo
 if [[ $rc -ne 0 ]]; then
-    fail "训练进程退出码 $rc —— 权重加载或 forward 失败，见上方日志"
+    fail "训练进程退出码 $rc —— 权重加载或 forward 失败，见日志 $RUNLOG"
 fi
 info "进程正常退出（rc=0）"
+[[ -n "$RUN_DIR" ]] && info "本次 run 目录: $RUN_DIR"
 
-# ---- 检查判据 ------------------------------------------------------------
-if [[ -n "$RUN_DIR" && -d "$RUN_DIR" ]]; then
-    info "本次 run 目录: $RUN_DIR"
-    LOGFILE="$RUN_DIR/train.log"
-    if [[ -f "$LOGFILE" ]]; then
-        echo
-        echo "--- 权重加载关键行 ---"
-        grep -nE "Loaded |Missing \(|rand init|Unexpected|size mismatch|shape mismatch" "$LOGFILE" | head -20 || echo "（没找到 'Loaded' 相关行，请人工检查 $LOGFILE）"
-        echo
-        echo "--- 前几步 loss ---"
-        grep -nE "loss|\"step\"" "$LOGFILE" | head -5 || true
-    else
-        echo "未找到 $LOGFILE"
-    fi
-    echo
-    echo "--- run 目录内容 ---"
-    ls -la "$RUN_DIR" | head -20
-else
-    info "未识别出新 run 目录（可能复用已有目录）。请人工检查 $G05_OUTPUT_DIR 下的 train.log。"
-fi
+# ---- 自动解析加载摘要（用 Python，避免 grep BRE 的量词语义坑）-----------
+# checkpoint_utils.py:496-509 打印的格式：
+#   Loaded                    <a> / <b>  ✅   (或 ⚠️ )
+#   Partial (handled)         <n> params  (dim mismatch, auto-fixed) / 0
+#   Missing (rand init)       <n> params  / 0
+#   Unexpected (skip)         <n> params  (not in model) / 0
+echo
+echo "--- 权重加载关键行（原文） ---"
+grep -aE "Loaded|Missing \(rand init\)|Partial \(handled\)|Unexpected \(skip\)|Shape mismatch" "$RUNLOG" \
+    | head -30 || echo "（没找到 —— 请人工检查 $RUNLOG）"
+echo
 
-cat <<'EOF'
+VERDICT_FILE="$(mktemp)"
+LOG="$RUNLOG" VERDICT_FILE="$VERDICT_FILE" python - <<'PY'
+import os, re, sys
 
-============================================================
- 人工确认清单（两条都满足才算通过）
-============================================================
- 1) 日志里出现      Loaded <N>/<N>
-    且              Missing (rand init): 0
-    —— 若不是 0，说明有参数没加载上（随机初始化），必须查清是哪些
- 2) 2 步跑完，loss 是有限值（不是 nan / inf）
+log_path = os.environ["LOG"]
+try:
+    txt = open(log_path, encoding="utf-8", errors="replace").read()
+except Exception as e:
+    print(f"[WARN] 读不到日志 {log_path}: {e}")
+    open(os.environ["VERDICT_FILE"], "w").write("unknown")
+    sys.exit(0)
 
- 不通过时先查：
-   - 权重字节数：11440519964（ls -l checkpoints/g05-base/checkpoints/model_state_dict.pt）
-   - configs/model/g05.yaml 的 pretrained_ckpt 路径
-   - action_dim / proprio_dim 是否为 27（configs/task/yam.yaml）
-============================================================
-EOF
+def last_int(pattern):
+    m = re.findall(pattern, txt)
+    return m[-1] if m else None
+
+loaded = re.findall(r"Loaded\s+(\d+)\s*/\s*(\d+)", txt)
+missing = last_int(r"Missing \(rand init\)\s+(\d+)")
+partial = last_int(r"Partial \(handled\)\s+(\d+)")
+unexpected = last_int(r"Unexpected \(skip\)\s+(\d+)")
+
+print("=" * 62)
+print(" 自动解析结果")
+print("=" * 62)
+if loaded:
+    a, b = loaded[-1]
+    print(f"   Loaded              = {a} / {b}")
+else:
+    print("   Loaded              = 未解析到")
+print(f"   Missing (rand init) = {missing if missing is not None else '未解析到'}")
+print(f"   Partial (handled)   = {partial if partial is not None else '未解析到'}")
+print(f"   Unexpected (skip)   = {unexpected if unexpected is not None else '未解析到'}")
+print()
+
+# 判据
+if not loaded:
+    verdict, why = "unknown", "没解析到 'Loaded a / b'。可能日志格式变了，或训练在加载前就失败了。"
+else:
+    a, b = int(loaded[-1][0]), int(loaded[-1][1])
+    if a != b:
+        verdict, why = "fail", f"Loaded {a}/{b}，有 {b - a} 个 key 没加载上"
+    elif missing is not None and int(missing) != 0:
+        verdict, why = "fail", f"Missing (rand init) = {missing}，有参数随机初始化"
+    elif partial is not None and int(partial) != 0:
+        verdict, why = "fail", f"Partial (handled) = {partial}，有参数维度不匹配被自动修复"
+    elif missing is None:
+        verdict, why = "unknown", "Loaded 全中，但没解析到 'Missing (rand init)' 行"
+    else:
+        verdict, why = "pass", f"Loaded {a}/{b}，Missing=0，Partial=0"
+
+print(f"  判定: {verdict.upper()}  —— {why}")
+open(os.environ["VERDICT_FILE"], "w").write(verdict)
+PY
+
+VERDICT="$(cat "$VERDICT_FILE" 2>/dev/null || echo unknown)"
+rm -f "$VERDICT_FILE"
+
+printf '=%.0s' {1..62}; echo
+case "$VERDICT" in
+  pass)
+      ok "L3 通过（权重完整加载）。另请确认上面的 loss 是有限值、非 nan/inf"
+      exit 0
+      ;;
+  fail)
+      if [[ "$STRICT" == "1" ]]; then
+          fail "L3 未通过。这是硬门禁：权重没完整加载，正式训练会白跑。日志：$RUNLOG"
+      else
+          warn "L3 未通过，但 STRICT=0，继续。日志：$RUNLOG"
+          exit 0
+      fi
+      ;;
+  *)
+      if [[ "$STRICT" == "1" ]]; then
+          fail "L3 无法自动判定（见上方）。请人工检查 $RUNLOG；确认无误后可 STRICT=0 跳过。"
+      else
+          warn "L3 无法自动判定，STRICT=0，继续。日志：$RUNLOG"
+          exit 0
+      fi
+      ;;
+esac

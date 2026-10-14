@@ -26,9 +26,17 @@
 #   EXP_DIR     训练输出目录（$G05_OUTPUT_DIR/yam/<exp>/）
 # 可选：
 #   HF_REPO_ID  默认 Zenith6666/yam-backbone
-#   MODE        all(默认) | last | step
+#   MODE        all(默认) | last | step | watch
 #   STEP        MODE=step 时用
 #   DRY_RUN     1 = 只列出会传什么，不实际传
+#   WATCH_INTERVAL  MODE=watch 时的轮询间隔秒数，默认 600（10 分钟）
+#
+# MODE=watch（无人值守用）：
+#   常驻轮询 EXP_DIR/checkpoints/，发现【新出现或大小已稳定】的 *.pt 就上传，
+#   已传过的跳过。容器被销毁时进程随之结束，不需要手动停。
+#   典型用法（由 start.sh 在后台拉起）：
+#     nohup env MODE=watch EXP_DIR=$EXP_DIR bash upload_checkpoints.sh \
+#       > /workspace/upload_checkpoints.log 2>&1 &
 # ============================================================================
 set -euo pipefail
 
@@ -38,11 +46,53 @@ EXP_DIR="${EXP_DIR:?请设置 EXP_DIR（训练输出目录，如 \$G05_OUTPUT_DI
 MODE="${MODE:-all}"
 STEP="${STEP:-}"
 DRY_RUN="${DRY_RUN:-0}"
+WATCH_INTERVAL="${WATCH_INTERVAL:-600}"
 export HF_TOKEN
 export HF_REPO_ID
 
 [[ -d "$EXP_DIR" ]] || { echo "[FAIL] EXP_DIR 不是目录: $EXP_DIR" >&2; exit 1; }
 EXP_DIR="$(cd "$EXP_DIR" && pwd)"
+
+# ---------------------------------------------------------------- watch 模式
+# 单独实现：不落盘状态，靠"已上传清单"文件避免重复传
+if [[ "$MODE" == "watch" ]]; then
+    STATE="${EXP_DIR}/.uploaded_checkpoints.txt"
+    touch "$STATE"
+    echo "[watch] 轮询 $EXP_DIR/checkpoints/，间隔 ${WATCH_INTERVAL}s，状态 $STATE"
+    while true; do
+        shopt -s nullglob
+        for f in "$EXP_DIR"/checkpoints/*.pt; do
+            b="$(basename "$f")"
+            [[ "$b" == "last.pt" ]] && continue
+            sz="$(wc -c < "$f" | tr -d ' ')"
+            key="${b}:${sz}"
+            grep -qxF "$key" "$STATE" 2>/dev/null && continue
+            # 等文件大小稳定（避免传到写一半的 checkpoint）
+            sleep 20
+            sz2="$(wc -c < "$f" | tr -d ' ')"
+            if [[ "$sz" != "$sz2" ]]; then
+                echo "[watch] $b 仍在写入（$sz -> $sz2），跳过本轮"
+                continue
+            fi
+            echo "[watch] 上传 $b ($((sz2/1024/1024)) MiB)"
+            if hf upload "$HF_REPO_ID" "$f" "checkpoints/$b" --repo-type model 2>&1 | tail -3; then
+                echo "$key" >> "$STATE"
+                echo "[watch] 已上传 $b"
+            else
+                echo "[watch] 上传失败 $b，下轮重试" >&2
+            fi
+        done
+        # sidecar（小，直接覆盖）
+        for sc in dataset_stats.json hydra_config.yaml action_tokenizer.pt train.log; do
+            case "$sc" in
+                hydra_config.yaml) src="$EXP_DIR/.hydra/config.yaml" ;;
+                *)                 src="$EXP_DIR/$sc" ;;
+            esac
+            [[ -f "$src" ]] && hf upload "$HF_REPO_ID" "$src" "$sc" --repo-type model >/dev/null 2>&1 || true
+        done
+        sleep "$WATCH_INTERVAL"
+    done
+fi
 
 echo "================================================================"
 echo " 上传 checkpoint 到 HF"

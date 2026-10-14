@@ -7,27 +7,37 @@
 #   git clone <你的仓库地址> G05-backbone-pkg && cd G05-backbone-pkg && \
 #     MODE=setup bash start.sh
 #
-# 分阶段跑（推荐，每步看清楚再往下）：
+# 分阶段跑：
 #   MODE=setup    装环境 + 拉权重/数据 + 校验（不训练）
-#   MODE=verify   跑 L1/L2/L3 三级验证（环境/数据已就绪）
+#   MODE=verify   跑 L1/L2/L3 三级验证（L3 自动判定，失败则非零退出）
 #   MODE=train    正式训练（后台）
-#   MODE=all      setup + verify（一条走完，不训练）
+#   MODE=all      ★ 全自动：setup -> verify(L3 门禁) -> L4 -> 训练 -> 后台守护上传
+#                 无人值守场景用这个；任何一级失败都会停下并打印原因
 #
 # 环境变量：
 #   HF_TOKEN          必需。HF 读写 token（平台密钥注入，勿硬编码）
 #   G05_OUTPUT_DIR    可选，默认 /workspace/output（容器内路径，靠 HF 落地）
-#   GPUS              可选，MODE=train 的卡数；默认取 NPROC_PER_NODE /
-#                     MLP_WORKER_GPU / nvidia-smi 探测
+#   GPUS              可选，训练卡数；默认取 NPROC_PER_NODE /
+#                     MLP_WORKER_GPU / MLP_WORKER_NUM / nvidia-smi 探测
 #   HF_ENDPOINT       可选，默认 https://huggingface.co
 #                     注意：实测百度百舸【连不上 hf-mirror】，不要设成它
 #   ONLY_TASK         可选，设了就只拉单任务，如 TASK-YAM-0006
+#   SKIP_L4           可选，=1 时跳过单批过拟合直接进训练
+#   STRICT_L3         默认 1。=0 时 L3 无法判定也继续（不推荐）
+#   AUTO_UPLOAD       默认 1。训练启动后自动拉起 checkpoint 守护上传
+#   UPLOAD_INTERVAL   守护上传轮询秒数，默认 600
 # ============================================================================
 set -euo pipefail
 
-MODE="${MODE:-setup}"
+# 默认全自动：装环境 -> 拉权重/数据 -> L1/L2/L3(门禁) -> L4 -> 训练 -> 守护上传
+MODE="${MODE:-all}"
 G05_OUTPUT_DIR="${G05_OUTPUT_DIR:-/workspace/output}"
 HF_ENDPOINT="${HF_ENDPOINT:-https://huggingface.co}"
 ONLY_TASK="${ONLY_TASK:-}"
+SKIP_L4="${SKIP_L4:-0}"
+STRICT_L3="${STRICT_L3:-1}"
+AUTO_UPLOAD="${AUTO_UPLOAD:-1}"
+UPLOAD_INTERVAL="${UPLOAD_INTERVAL:-600}"
 export G05_OUTPUT_DIR HF_ENDPOINT
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -50,6 +60,26 @@ activate_venv() {
     source .venv/bin/activate
     set -u
     info "python = $(command -v python)  ($(python -V 2>&1))"
+}
+
+# 带重试地跑一个脚本。无人值守时网络抖动不该让整个任务失败。
+# 用法： retry 3 60 bash download_weights.sh
+retry() {
+    local tries="$1" delay="$2"; shift 2
+    local i=1 rc=0
+    while true; do
+        rc=0
+        "$@" || rc=$?
+        if [[ $rc -eq 0 ]]; then
+            return 0
+        fi
+        if [[ $i -ge $tries ]]; then
+            fail "重试 $tries 次仍失败（退出码 $rc）：$*"
+        fi
+        warn "第 $i/$tries 次失败（退出码 $rc），${delay}s 后重试：$*"
+        i=$((i+1))
+        sleep "$delay"
+    done
 }
 
 # ---------------------------------------------------------------- 前置检查
@@ -97,14 +127,14 @@ do_setup() {
     activate_venv
     python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'avail', torch.cuda.is_available())"
 
-    step "2. 下载权重（约 11.5GB，实测约 3 分钟）"
-    bash download_weights.sh
+    step "2. 下载权重（约 11.5GB，实测约 3 分钟；失败自动重试 3 次）"
+    retry 3 60 bash download_weights.sh
 
-    step "3. 下载数据集"
+    step "3. 下载数据集（失败自动重试 3 次）"
     if [[ -n "$ONLY_TASK" ]]; then
-        ONLY_TASK="$ONLY_TASK" bash download_dataset.sh
+        retry 3 60 env ONLY_TASK="$ONLY_TASK" bash download_dataset.sh
     else
-        bash download_dataset.sh
+        retry 3 60 bash download_dataset.sh
     fi
 
     step "4. 数据完整性自检"
@@ -186,31 +216,29 @@ do_verify() {
         model.pretrained_ckpt=null model.max_steps=10 logger.mode=offline
     ok "L2 通过（数据管线没崩）"
 
-    step "L3 ★ 权重加载验证（这一级才有 11GB 加载）"
-    bash verify_weight_load.sh
-    warn "L3 请人工确认上面日志里有 Loaded N/N 且 Missing (rand init): 0"
+    step "L3 ★ 权重加载验证（这一级才有 11GB 加载；脚本自动判定）"
+    STRICT="$STRICT_L3" bash verify_weight_load.sh
+    ok "L3 通过（权重完整加载）"
 
-    step "verify 阶段完成"
-    cat <<'EOF'
-下一步（人工确认 L3 后再执行）：
-
-  # L4 单批过拟合：loss 应明显下降
-  bash scripts/run/finetune.sh 1 yam --overfit_batch 5 model.max_steps=500 logger.mode=offline
-
-  # L5 少量数据真实训练：确认存盘与上传通路
-  bash scripts/run/finetune.sh 1 yam --max_datasets 1 model.max_steps=20 logger.mode=offline
-EOF
+    step "L4 单批过拟合（loss 应明显下降）"
+    if [[ "$SKIP_L4" == "1" ]]; then
+        warn "SKIP_L4=1，跳过 L4"
+    else
+        bash scripts/run/finetune.sh 1 yam --overfit_batch 5 model.max_steps=500 \
+            logger.mode=offline
+        ok "L4 跑完（请确认上面 loss 明显下降）"
+    fi
 }
 
 # ============================================================================
-# train：正式训练（后台）
+# train：正式训练（后台）+ 自动守护上传
 # ============================================================================
 do_train() {
     activate_venv
 
-    local n="${GPUS:-${NPROC_PER_NODE:-${MLP_WORKER_GPU:-$(nvidia-smi -L 2>/dev/null | wc -l | tr -d ' ')}}}"
+    local n="${GPUS:-${NPROC_PER_NODE:-${MLP_WORKER_GPU:-${MLP_WORKER_NUM:-$(nvidia-smi -L 2>/dev/null | wc -l | tr -d ' ')}}}}"
     [[ "${n:-0}" -ge 1 ]] || n=1
-    info "GPU 数: $n"
+    info "GPU 数: $n（来源: GPUS/NPROC_PER_NODE/MLP_WORKER_GPU/MLP_WORKER_NUM/nvidia-smi）"
 
     step "正式训练（后台，日志 -> /workspace/train.stdout.log）"
     nohup bash scripts/run/finetune.sh "$n" yam logger.mode=offline \
@@ -219,25 +247,49 @@ do_train() {
     echo "$pid" > /workspace/train.pid
     ok "训练 PID=$pid（已写入 /workspace/train.pid）"
 
-    sleep 60
-    step "启动后 60 秒日志尾部"
-    tail -c 3000 /workspace/train.stdout.log || true
-
-    local exp
-    exp="$(ls -1dt "$G05_OUTPUT_DIR"/yam/*/ 2>/dev/null | head -1 || true)"
-    if [[ -n "$exp" ]]; then
-        ok "本次 exp 目录: $exp"
-        echo "$exp" > /workspace/exp_dir.txt
-        cat <<EOF
-
-训练期间的必做操作（容器临时，产物必须落 HF）：
-  EXP_DIR=$exp bash upload_checkpoints.sh
-  先看会传什么：DRY_RUN=1 EXP_DIR=$exp bash upload_checkpoints.sh
-  只传最后一个：MODE=last EXP_DIR=$exp bash upload_checkpoints.sh
-EOF
-    else
-        warn "还没识别出 exp 目录，稍后手动看：ls $G05_OUTPUT_DIR/yam/"
+    # 等 exp 目录出现（最多 5 分钟）
+    local exp="" i=0
+    while [[ $i -lt 30 ]]; do
+        sleep 10; i=$((i+1))
+        exp="$(ls -1dt "$G05_OUTPUT_DIR"/yam/*/ 2>/dev/null | head -1 || true)"
+        [[ -n "$exp" ]] && break
+    done
+    if [[ -z "$exp" ]]; then
+        warn "5 分钟内没识别出 exp 目录，守护上传未启动。稍后手动："
+        echo "     EXP_DIR=<exp目录> bash upload_checkpoints.sh"
+        return 0
     fi
+    ok "本次 exp 目录: $exp"
+    echo "$exp" > /workspace/exp_dir.txt
+
+    if [[ "$AUTO_UPLOAD" == "1" ]]; then
+        step "启动 checkpoint 守护上传（每 ${UPLOAD_INTERVAL}s 轮询一次）"
+        nohup env MODE=watch EXP_DIR="$exp" WATCH_INTERVAL="$UPLOAD_INTERVAL" \
+            bash upload_checkpoints.sh > /workspace/upload_checkpoints.log 2>&1 &
+        echo $! > /workspace/upload.pid
+        ok "守护上传 PID=$(cat /workspace/upload.pid)  日志 /workspace/upload_checkpoints.log"
+        warn "容器销毁后守护进程随之结束；它会把 checkpoint 陆续推到 HF"
+    else
+        warn "AUTO_UPLOAD=0，未启动守护上传。训练期间请手动："
+        echo "     EXP_DIR=$exp bash upload_checkpoints.sh"
+    fi
+
+    step "启动后 90 秒训练日志尾部"
+    sleep 90
+    tail -c 4000 /workspace/train.stdout.log || true
+
+    cat <<EOF
+
+============================================================
+ 后续（训练在后台跑，任务结束后容器销毁）
+============================================================
+ 训练日志 : tail -f /workspace/train.stdout.log
+ 上传日志 : tail -f /workspace/upload_checkpoints.log
+ exp 目录 : $exp
+ 
+ 训练结束后（仍在同一容器内时）执行收尾：
+   EXP_DIR=$exp bash upload_output.sh
+EOF
 }
 
 # ---------------------------------------------------------------- 分发
@@ -245,7 +297,11 @@ case "$MODE" in
     setup)  do_setup ;;
     verify) do_verify ;;
     train)  do_train ;;
-    all)    do_setup; do_verify ;;
+    all)
+        do_setup
+        do_verify          # L3 不通过会在这里非零退出，不会带着坏权重去训练
+        do_train
+        ;;
     *)      fail "未知 MODE=$MODE（可选 setup | verify | train | all）" ;;
 esac
 
