@@ -17,11 +17,12 @@ exp_name: "${oc.env:EXP_NAME, ${now:%Y-%m-%d_%H-%M-%S}}"
 output_dir: ${hydra:runtime.output_dir}
 
 # checkpointing
-# 默认 2000 步 ≈ 16 个 epoch（991 条 episode、batch_size 8 → 约 124 步/epoch），
-# 而 max_epochs 只有 10 —— 意味着【整个训练只在结束时存一次 checkpoint】。
-# 平台容器是临时的，任务被杀/自动停止就全丢，所以调小到 500 步（≈4 epoch），
-# 代价是每个 checkpoint 约 11.44GB：10 epoch ≈ 2.5 个 checkpoints ≈ 29GB，可接受。
-# 磁盘要更多余量时可再调小，配 upload_checkpoints.sh 定期上传（HF）。
+# 每个 checkpoint 约 11.44GB。官方默认 2000 步，但本任务的训练规模很小
+# （configs/model/g05.yaml: max_epochs=2, batch_size=16 每卡），总步数大约只有
+# 几百到一两千 —— 沿用 2000 会导致【整个训练只在结束时存一次 checkpoint】。
+# 平台容器是临时的，任务被杀/自动停止就全丢，所以调到 500 步。
+# 配 upload_checkpoints.sh 的守护模式定期推到 HF（每 10 分钟轮询）。
+# ⚠️ 注意 batch_size 是【每卡】的：全局 batch = batch_size × 卡数。
 checkpointing_steps: 500
 
 # eval
