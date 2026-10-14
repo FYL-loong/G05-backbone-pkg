@@ -149,11 +149,46 @@ if [[ "${AVAIL_GB:-0}" -lt 60 ]]; then
     warn "可用磁盘 ${AVAIL_GB}G 偏小（11GB 权重 + 每个 checkpoint 11.44GB）"
 fi
 
+# ---- 网络探测：setup 阶段要访问这些域名，提前暴露问题 ----
+# 实测（2026-03）：github.com 在国内常不可达，而 uv 默认从 GitHub Releases 下载
+# Python 3.10（NGC 镜像自带 3.12，不满足 requires-python >=3.10.16,<3.11）。
+probe() {
+    local host="$1" what="$2"
+    if timeout 12 bash -c "exec 3<>/dev/tcp/$host/443" 2>/dev/null; then
+        ok "  可达   $host   ($what)"
+        return 0
+    fi
+    warn "  不可达 $host   ($what)"
+    return 1
+}
+info "网络探测（setup 阶段要访问的域名）:"
+probe mirrors.aliyun.com   "uv.lock 里 1049 个包" || true
+probe download.pytorch.org "torch cu128 轮子" || true
+probe pypi.nvidia.com      "nvidia 依赖" || true
+probe astral.sh            "安装 uv" || true
+if ! probe gh-proxy.com "Python 3.10 下载镜像（默认启用）"; then
+    warn "  gh-proxy 不可达 → 若本地没有 Python 3.10，uv sync 会失败。"
+    warn "  备选：UV_PYTHON_INSTALL_MIRROR=<其它镜像> 或 UV_PYTHON_INSTALL_MIRROR= （走官方源）"
+fi
+
 # ============================================================================
 # setup：装环境 + 拉权重 + 拉数据 + 自检
 # ============================================================================
 do_setup() {
     run_stage setup-install "安装环境（uv sync，首次约 10-30 分钟）"
+    # NGC 镜像自带 Python 3.12，但项目要求 3.10.16（.python-version / requires-python），
+    # 所以 uv 必须联网下载一个独立 Python 3.10 —— 源默认是 GitHub Releases，
+    # 国内不可靠。这里默认启用国内镜像；若它不通，用
+    #   UV_PYTHON_INSTALL_MIRROR= bash start.sh    回退官方源
+    if [[ -z "${UV_PYTHON_INSTALL_MIRROR+x}" ]]; then
+        export UV_PYTHON_INSTALL_MIRROR="https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone/releases/download"
+        info "启用 Python 下载镜像: $UV_PYTHON_INSTALL_MIRROR"
+    else
+        info "UV_PYTHON_INSTALL_MIRROR = ${UV_PYTHON_INSTALL_MIRROR:-<空，走官方 GitHub>}"
+    fi
+    # torch cu128 wheel 数百 MB，默认超时可能不够
+    export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-300}"
+
     if [[ -x .venv/bin/python ]]; then
         ok ".venv 已存在，跳过 setup_env.sh（要重装先 rm -rf .venv）"
     else

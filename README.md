@@ -31,35 +31,95 @@ G0.5 复现第二步 —— **backbone（VLA 全模型）微调**代码。从上
 > 所以流程做成了「一条命令全自动跑完」，中间的 L3 权重加载门禁由 `start.sh` **自动判定**
 > （见 `verify_weight_load.sh` 的日志解析），不通过就停下、不会带着坏权重去训练。
 
+### 镜像与 Python 版本（**选错必失败**）
+
+| 项 | 要求 | 原因 |
+|---|---|---|
+| 镜像 | **`pytorch-ngc`，CUDA ≥ 12.8** | `pyproject.toml` 把 torch 钉在 `pytorch-cu128` index；`deepspeed` 等需 `nvcc` 就地编译 |
+| 推荐 tag | **`25.04-py3`**（`2.7.0-cu12.8.0-py3.12-ubuntu24.04`） | 与 `torch==2.7.1` 同代，cu128 精确匹配 |
+| 可选 tag | `25.05-py3` / `25.06-py3`（均为 cu12.8.x） | 同 CUDA 12.8 线 |
+| ❌ 不要用 | `2.5.0-cu12.6.2-py3.10`（codec 用的那个） | CUDA 12.6 < 12.8 |
+| ❌ 不要用 | `2.4.0` 及更早（≤ CUDA 12.4） | 太旧 |
+
+**⚠️ 为什么 Python 版本是关键**：
+
+```
+.python-version             = 3.10.16
+pyproject requires-python   = ">=3.10.16,<3.11"
+NGC 镜像自带                 = Python 3.12      ← 不满足约束
+```
+
+→ **`uv` 必须自己下载一个独立的 Python 3.10**，默认源是 **GitHub Releases**
+（`astral-sh/python-build-standalone`）。
+
+**实测网络（2026-03，国内）**：
+
+| 域名 | 用途 | 可达 |
+|---|---|---|
+| `mirrors.aliyun.com` | `uv.lock` 里 1049 个包（293 个 registry 条目） | ✅ |
+| `download.pytorch.org` | torch cu128 轮子（69 条） | ✅ |
+| `pypi.nvidia.com` | nvidia 依赖 | ✅ |
+| `astral.sh` | 安装 `uv` | ✅ |
+| `gh-proxy.com` | Python 3.10 下载镜像 | ✅ |
+| **`github.com`** | **uv 下载 Python 的默认源** | ❌ **不可达** |
+
+**所以 `start.sh` / `setup_env.sh` 默认启用 Python 下载镜像**：
+
+```bash
+UV_PYTHON_INSTALL_MIRROR="https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone/releases/download"
+UV_HTTP_TIMEOUT=300     # torch 轮子数百 MB，默认超时不够
+```
+
+**如果该镜像也不通**，回退官方源（需要能访问 GitHub）：
+
+```bash
+UV_PYTHON_INSTALL_MIRROR= bash start.sh
+```
+
+### 依赖里哪些要编译
+
+`uv.lock` 已锁死版本，**大部分是预编译 wheel**：
+
+| 包 | 形态 | 需编译 |
+|---|---|---|
+| `flash-attn-4` | `py3-none-any.whl`（纯 Python） | ❌ |
+| `flash-linear-attention` | `py3-none-any.whl` | ❌ |
+| `liger-kernel` | `py3-none-any.whl` | ❌ |
+| **`deepspeed` 0.15.4** | **只有 sdist** | ✅ **需要 `nvcc`** |
+| 另有 11 个 | 仿真/几何依赖（`gym` / `robomimic` / `bddl` / `toppra` / `easydict` / `egl-probe` / `antlr4-python3-runtime` / `sharedarray` / `asciitree` / `future` / `timeout-decorator`） | ✅ 纯 C/C++，不需 CUDA |
+
+**这 12 个包里任何一个编译失败，整个 `uv sync` 都会失败**（即使其中多数是仿真依赖、实际训练用不到）。
+
 ### 一条命令（全自动，无人值守）
 
 平台任务的「执行命令」框里填这一条 —— **不需要任何 MODE 参数**：
 
 ```bash
-git clone https://github.com/FYL-loong/G05-backbone-pkg.git G05-backbone-pkg && \
-  cd G05-backbone-pkg && bash start.sh
+set -e
+export HF_TOKEN="hf_你的token"
+git clone https://github.com/FYL-loong/G05-backbone-pkg.git G05-backbone-pkg
+cd G05-backbone-pkg
+bash start.sh
 ```
 
-环境变量（在平台任务里配）：
-
-| 变量 | 值 |
-|---|---|
-| `HF_TOKEN` | HF **读写** token（密钥注入，勿硬编码） |
+`HF_TOKEN` 写在执行命令里（平台环境变量栏存不了），**不要写进任何文件** —— 那会被 `git push` 上去。
 
 `bash start.sh`（等价 `MODE=all`）会依次自动执行：
 
 | 阶段 | 内容 | 失败行为 |
 |---|---|---|
+| preflight | token / GPU 显存 / 磁盘 / **网络探测** | 非零退出 |
 | setup | `uv sync` → 拉 11.5GB 权重（带字节校验）→ 拉 10 个任务数据集 → stats 自检 | 非零退出 |
 | L1 | `--dry-run` 配置组装 | 非零退出 |
 | L2 | `--test` 数据管线 + forward/backward（权重随机初始化） | 非零退出 |
 | **L3 ★** | **加载 11GB 权重跑 2 步**，脚本解析 `Loaded a/b` 与 `Missing (rand init)` | **不通过则非零退出，不进训练** |
 | L4 | 单批过拟合（`--overfit_batch 5`，loss 应明显下降） | 非零退出 |
-| train | 8 卡正式训练（后台） | — |
+| train | 正式训练（后台，卡数自动探测） | — |
 | 守护上传 | 训练启动后自动拉起 `upload_checkpoints.sh MODE=watch`，每 10 分钟把新 checkpoint 推到 HF | — |
+| 等待 + 收尾 | 阻塞等训练结束 → 等 120s 落盘 → 停守护 → **自动上传权重/日志/配置/环境快照** | — |
 
-**下载与安装步骤都带重试**（`download_weights.sh` / `download_dataset.sh` 各重试 3 次，间隔 60s），
-网络抖动不会让整个任务失败。
+**任何阶段失败都会自动把诊断上传到 HF**（`diagnostics/<阶段>_<时间戳>/`），
+容器销毁后仍可事后排查。下载与安装步骤都带重试（各 3 次，间隔 60s）。
 
 ### 只跑部分阶段（调试用）
 
