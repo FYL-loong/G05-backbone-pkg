@@ -1,0 +1,35 @@
+# ── 权重 / 数据集 / 输出（由脚本从 HF 下载，不入库）──
+*.pt
+/checkpoints/
+/data
+/outputs/
+/runs/
+/wandb/
+
+# ── 环境 ──
+.env
+.venv/
+venv/
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.so
+build/
+dist/
+
+# ── 编辑器 / 系统 ──
+.vscode/
+.idea/
+.DS_Store
+
+# ── 临时 / 日志 ──
+tmp/
+*.log
+
+# ── 本地工作目录（改包时留的原始文件备份，不入库）──
+_original_backup/
+eval/
+finetune.jsonl
+
