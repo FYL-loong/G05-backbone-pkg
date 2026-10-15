@@ -166,6 +166,20 @@ exclude = ["cache"]
 [tool.uv.pip]
 index-strategy = "unsafe-best-match"
 
+# ── 只求解我们实际运行的平台 ─────────────────────────────────────────────
+# uv.lock 是多平台的（含 aarch64），而 `uv sync` 默认会【为所有平台验证可解】。
+# 求解 aarch64 分支时会失败：
+#   packaging==25.0 在 download.pytorch.org/whl/cu128 上存在但版本不符，
+#   uv 默认只认"第一个包含该包的索引"（防依赖混淆），于是不再回退到
+#   mirrors.aliyun.com / pypi.org，导致无解。
+# environments 是 uv 报错时自己给出的建议键，收窄到本平台后不再求解 aarch64。
+# 另有 `--index-strategy unsafe-best-match` 作为命令行回退（见 setup_env.sh），
+# 故意【不】写进 [tool.uv]，避免万一键名不被支持导致 manifest 直接无效。
+[tool.uv]
+environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
 [tool.uv.sources]
 torch = [
   { index = "pytorch-cu128", marker = "sys_platform != 'darwin'"},

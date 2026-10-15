@@ -72,14 +72,40 @@ fi
 info "uv sync（pyproject.toml + uv.lock；包主要来自 mirrors.aliyun.com，torch 来自 download.pytorch.org）..."
 info "首次约 10-30 分钟：其中 deepspeed 等 12 个包需要本地编译（依赖镜像里的 nvcc）"
 
-if ! uv sync; then
-    warn "uv sync 失败。常见原因与排查方向："
-    warn "  1) Python 3.10 下载失败 → 试 UV_PYTHON_INSTALL_MIRROR= bash setup_env.sh"
-    warn "  2) 包索引不可达        → 试 export UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple"
-    warn "  3) 编译失败（deepspeed 等）→ 确认镜像里有 nvcc：nvcc --version"
-    warn "  完整日志见上方输出；start.sh 会把诊断上传到 HF"
-    exit 1
-fi
+# 多级回退。历史上出现过两类失败：
+#   A) 为 aarch64 平台求解失败（packaging==25.0 只在 aliyun 上，而 uv 先撞上
+#      pytorch-cu128 索引里同名但版本不符的包，默认不回退）→ 已用
+#      [tool.uv] environments 收窄平台 + index-strategy=unsafe-best-match 解决
+#   B) 锁文件与 pyproject 不一致导致重新解析 → 用 --frozen 直接按锁文件安装
+# 无人值守场景下不能只赌一种方式，所以依次尝试。
+SYNC_OK=0
+run_sync() {
+    local desc="$1"; shift
+    info "尝试：uv sync $*"
+    if uv sync "$@"; then
+        ok_sync "$desc"
+        return 0
+    fi
+    warn "失败：$desc"
+    return 1
+}
+ok_sync() { printf '\033[32m[env]\033[0m ✅ %s\n' "$1"; SYNC_OK=1; }
+
+run_sync "方式1：常规 uv sync" \
+    || run_sync "方式2：--index-strategy unsafe-best-match（允许跨索引选版本）" --index-strategy unsafe-best-match \
+    || run_sync "方式3：--frozen（完全按 uv.lock 安装，不重新解析）" --frozen \
+    || run_sync "方式4：--frozen + unsafe-best-match" --frozen --index-strategy unsafe-best-match \
+    || {
+        warn "uv sync 全部方式失败。排查方向："
+        warn "  1) Python 3.10 下载失败 → UV_PYTHON_INSTALL_MIRROR= bash setup_env.sh 回退官方源"
+        warn "  2) 包索引不可达        → export UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple"
+        warn "  3) aarch64 求解问题    → 确认 pyproject.toml 里有 [tool.uv] environments"
+        warn "  4) 编译失败（deepspeed 等）→ 确认镜像里有 nvcc：nvcc --version"
+        warn "  完整日志见上方输出；start.sh 会把诊断上传到 HF"
+        exit 1
+    }
+
+[[ "$SYNC_OK" == "1" ]] || fail "uv sync 未成功"
 
 # ---------------------------------------------------------------- 5. 验证
 info "验证环境 ..."

@@ -124,10 +124,43 @@ bash start.sh
 ### 只跑部分阶段（调试用）
 
 ```bash
-MODE=setup  bash start.sh     # 只装环境 + 拉权重/数据 + 校验
-MODE=verify bash start.sh     # 只跑 L1/L2/L3/L4
+MODE=setup  bash start.sh     # 只装环境 + 拉权重/数据 + 校验（不训练）
+MODE=verify bash start.sh     # 只跑 L1/L2/L3/L4（不含 L3 之后的训练）
 MODE=train  bash start.sh     # 只启动训练（环境/数据须已就绪）
 ```
+
+#### 建议：首次先用 **1 卡** 验证环境
+
+`uv sync` 是整个流程唯一没被验证过的环节（`deepspeed` 要就地编译、`uv` 要联网
+下载 Python 3.10）。**用它失败一次的成本，远低于 8 卡白等一小时。**
+
+> ⚠️ 但这一步**不能代替 8 卡的完整跑**：1 卡的容器**销毁后不保留任何东西**，
+> 8 卡任务仍需重新 `uv sync` + 重新下载。它的价值是**提前暴露环境问题**，
+> 不是"预热"。
+
+```bash
+# 1 卡任务，执行命令：
+set -e
+export HF_TOKEN="hf_你的token"
+git clone https://github.com/FYL-loong/G05-backbone-pkg.git G05-backbone-pkg
+cd G05-backbone-pkg
+MODE=setup bash start.sh
+```
+
+**它会验证 / 产出**：
+
+| 检查 | 期望输出 |
+|---|---|
+| 网络探测 | 5 行全 `[ OK ] 可达` |
+| Python 3.10 获取 | `[env] ✅ 已找到` 或 联网下载成功 |
+| `uv sync`（约 10–30 分钟） | `[env] venv python: Python 3.10.x` |
+| torch 可用性 | `torch 2.7.1+cu128  cuda=12.8  available=True` |
+| 关键库导入 | `flash_attn` / `fla` / `liger_kernel` / `deepspeed` 全部有版本号 |
+| 权重下载 + **字节校验** | `[ OK ] 全部权重校验通过` |
+| 数据集 | 10 个任务，合计 `episodes=991` |
+| stats 自检 | `[ OK ] stats 维度与退化检测全部通过` |
+
+**不验证**（要 8 卡那轮才验）：L1/L2/L3 权重加载、L4 过拟合、训练本身。
 
 ### 可选环境变量
 
