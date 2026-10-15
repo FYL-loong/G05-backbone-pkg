@@ -250,7 +250,7 @@ MODE=train  bash start.sh     # 只启动训练（环境/数据须已就绪）
 ```bash
 # 1 卡任务，执行命令：
 set -e
-export HF_TOKEN="hf_你的token"
+export HF_TOKEN="hf_把你的真实token填这里"
 git clone https://github.com/FYL-loong/G05-backbone-pkg.git G05-backbone-pkg
 cd G05-backbone-pkg
 MODE=setup bash start.sh
