@@ -35,6 +35,7 @@ cd "$PROJECT_ROOT"
 fail() { printf '\033[31m[FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
 info() { printf '\033[36m[INFO]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[32m[ OK ]\033[0m %s\n' "$*"; }
+warn() { printf '\033[33m[WARN]\033[0m %s\n' "$*"; }
 
 BASE_REPO="${BASE_REPO:-OpenGalaxea/G05}"
 CODEC_REPO="${CODEC_REPO:-Zenith6666/yam-actioncodec}"
@@ -44,36 +45,101 @@ export HF_ENDPOINT="${HF_ENDPOINT:-https://huggingface.co}"
 
 mkdir -p checkpoints data/stats
 
+# ---------------------------------------------------------------- 下载辅助
+# 为什么不用 `hf download --include "dir/**"`：
+#   实测该 glob 在平台上只下到了 processor 的 8 个文件，而 `g05-base/**` 一个都没下，
+#   且 hf download 在 include 匹配不到时【只警告不报错】（退出码仍是 0），
+#   导致失败被推迟到最后的校验环节才发现。
+#   所以改为【显式文件路径】逐个下载：路径明确、每个文件都报告大小、
+#   缺了立刻失败，完全绕开 include/glob 的版本语义差异。
+#
+# 下载 repo 里的 rpath，并【确保】它最终位于 exact_path。
+# 做法：先按 hf 的默认行为下到 <tmpdir>/<rpath>，再 mv 到 exact_path。
+# 这样既不依赖 glob，也不依赖 hf 的落盘规则。
+dl() {
+  local repo="$1" rpath="$2" exact_path="$3"
+  if [[ -f "$exact_path" ]]; then
+    info "已存在，跳过：$exact_path ($(wc -c < "$exact_path" | tr -d ' ') 字节)"
+    return 0
+  fi
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  info "下载 $repo :: $rpath"
+  if ! hf download "$repo" "$rpath" --repo-type model --local-dir "$tmpdir"; then
+    warn "hf download 失败（退出码非零）：$repo/$rpath"
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  local landed="$tmpdir/$rpath"
+  if [[ ! -f "$landed" ]]; then
+    warn "hf download 退出码 0，但预期落盘文件不存在：$landed"
+    warn "  实际拿到："
+    find "$tmpdir" -type f 2>/dev/null | head -10 | sed 's/^/    /' || true
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  mkdir -p "$(dirname "$exact_path")"
+  mv -f "$landed" "$exact_path"
+  rm -rf "$tmpdir"
+  ok "$exact_path ($(wc -c < "$exact_path" | tr -d ' ') 字节)"
+  return 0
+}
+
 echo "================================================================"
 echo " 1/3 官方 backbone + processor（$BASE_REPO）"
 echo "     注：这是门控仓库，账号需已在仓库页面点过 Agree"
+echo "     预期：11.44GB 的 model_state_dict.pt + 41KB config + 5.3MB stats"
 echo "================================================================"
+# 先列仓库清单，确认目标路径真实存在（拼错会立刻暴露，而不是静默跳过）
+info "核对 HF 仓库文件清单 ..."
+if hf ls "$BASE_REPO" --repo-type model > /tmp/_g05_ls.txt 2>&1; then
+  info "仓库条目数: $(grep -c . /tmp/_g05_ls.txt || echo 0)，其中含 'g05-base' 的："
+  grep 'g05-base' /tmp/_g05_ls.txt | head -10 | sed 's/^/    /' \
+    || warn "  没有任何 g05-base 条目 —— 路径或门控权限可能有问题"
+else
+  warn "hf ls 失败（仅诊断用途，不阻塞）："
+  head -10 /tmp/_g05_ls.txt | sed 's/^/    /' || true
+fi
+
+dl "$BASE_REPO" "g05-base/checkpoints/model_state_dict.pt" \
+   "checkpoints/g05-base/checkpoints/model_state_dict.pt" \
+  || fail "主干权重下载失败 —— 见上方输出；也可用 curl 断点续传（见脚本末尾提示）"
+dl "$BASE_REPO" "g05-base/.hydra/config.yaml" \
+   "checkpoints/g05-base/.hydra/config.yaml" || warn "hydra config 缺失（非致命）"
+dl "$BASE_REPO" "g05-base/dataset_stats.json" \
+   "checkpoints/g05-base/dataset_stats.json" || warn "dataset_stats 缺失（非致命）"
+
+echo "--- processor（8 个小文件；浅层 glob 已验证可用）---"
 hf download "$BASE_REPO" --repo-type model --local-dir checkpoints \
-  --include "g05-base/**" \
-  --include "qwen3_5_2b_base_processor/**"
+  --include "qwen3_5_2b_base_processor/*" || fail "processor 下载失败"
 
 echo "================================================================"
 echo " 2/3 微调后 ActionCodec 码本（$CODEC_REPO）"
+echo "     注意：这是【微调后】的 codec（约 170MB），不是官方 506MB 那个"
 echo "================================================================"
-hf download "$CODEC_REPO" action_tokenizer_yam.pt --repo-type model --local-dir checkpoints
+dl "$CODEC_REPO" "action_tokenizer_yam.pt" "checkpoints/action_tokenizer_yam.pt" \
+  || fail "codec 下载失败"
 
 echo "================================================================"
 echo " 3/3 YAM 归一化 stats"
 echo "================================================================"
-hf download "$CODEC_REPO" yam_stats.json --repo-type model --local-dir data/stats
+dl "$CODEC_REPO" "yam_stats.json" "data/stats/yam_stats.json" || fail "stats 下载失败"
 
 # ---------------------------------------------------------------- 校验
 echo
 echo "================================================================"
-echo " 下载后校验（防截断）"
+echo " 下载后校验（防截断/防漏下）"
 echo "================================================================"
 
-# 官方权威字节数（来自 HF API）
+# 官方权威字节数（来自 HF API 实测）
 declare -A WANT=(
   ["checkpoints/g05-base/checkpoints/model_state_dict.pt"]=11440519964
   ["checkpoints/g05-base/.hydra/config.yaml"]=41437
   ["checkpoints/g05-base/dataset_stats.json"]=5258626
-  ["checkpoints/action_tokenizer_yam.pt"]=506886775
+  # ⚠️ 这里必须是【微调后】字节数。官方 action_tokenizer.pt 是 506,886,775，
+  #    但 backbone 训练用的是微调版 codec（用户已决定弃用官方基线），
+  #    所以脚本下载的就是下面这个大小，不要写成官方值。
+  ["checkpoints/action_tokenizer_yam.pt"]=169709565
 )
 
 bad=0
