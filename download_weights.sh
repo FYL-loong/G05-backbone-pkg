@@ -91,13 +91,14 @@ echo "     注：这是门控仓库，账号需已在仓库页面点过 Agree"
 echo "     预期：11.44GB 的 model_state_dict.pt + 41KB config + 5.3MB stats"
 echo "================================================================"
 # 先列仓库清单，确认目标路径真实存在（拼错会立刻暴露，而不是静默跳过）
+# 注意：CLI 是 `hf repo-files`，没有 `hf ls`（0.35.0 实测）。
 info "核对 HF 仓库文件清单 ..."
-if hf ls "$BASE_REPO" --repo-type model > /tmp/_g05_ls.txt 2>&1; then
+if hf repo-files "$BASE_REPO" > /tmp/_g05_ls.txt 2>&1; then
   info "仓库条目数: $(grep -c . /tmp/_g05_ls.txt || echo 0)，其中含 'g05-base' 的："
   grep 'g05-base' /tmp/_g05_ls.txt | head -10 | sed 's/^/    /' \
     || warn "  没有任何 g05-base 条目 —— 路径或门控权限可能有问题"
 else
-  warn "hf ls 失败（仅诊断用途，不阻塞）："
+  warn "hf repo-files 失败（仅诊断用途，不阻塞）："
   head -10 /tmp/_g05_ls.txt | sed 's/^/    /' || true
 fi
 
