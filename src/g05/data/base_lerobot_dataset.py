@@ -856,6 +856,40 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         """
         return np.random.randint(self._start_idx, self._end_idx)
 
+    def _warn_sample_retry(self, stage: str, sample_idx: int, location: str,
+                           attempt: int, err: BaseException) -> None:
+        """节流后的样本「加载/构建」失败告警。
+
+        上游是【每次失败都完整打一条】。当失败是系统性的（例如缺系统 ffmpeg
+        导致 torchcodec 无法解码任何 MP4），MAX_GETITEM_ATTEMPT=10000，
+        每个样本会刷 1 万条、每条还内嵌一大段 FFmpeg 错误 —— 实测单个 4 卡任务
+        产生 3000 万行日志，把平台的 100 万行下载上限瞬间打满，真正的报错被淹没。
+
+        因此这里：
+          - 第 1 次失败：完整打印（含异常），便于定位
+          - 之后每 `_LOAD_ERR_LOG_EVERY` 次：只打一行摘要
+          - 达到 MAX_GETITEM_ATTEMPT：完整打印一次（含异常），这是最关键的信号
+        """
+        first = (attempt == 1)
+        last = (attempt >= MAX_GETITEM_ATTEMPT)
+        if first or last:
+            logger.warning(
+                "Error %s sample %s (%s) (attempt %d/%d). "
+                "Retrying with a random index. Error: %s",
+                stage, sample_idx, location, attempt, MAX_GETITEM_ATTEMPT, err,
+            )
+        elif attempt % self._LOAD_ERR_LOG_EVERY == 0:
+            logger.warning(
+                "Error %s sample %s (attempt %d/%d, 已节流，每 %d 次打一条)。"
+                "错误类型: %s: %s",
+                stage, sample_idx, attempt, MAX_GETITEM_ATTEMPT,
+                self._LOAD_ERR_LOG_EVERY,
+                type(err).__name__, str(err).split("\n")[0][:160],
+            )
+
+    # 每 N 次失败才打一条摘要（第 1 次与最后一次始终完整打印）
+    _LOAD_ERR_LOG_EVERY = 500
+
     def __getitem__(self, idx):
         if idx >= len(self):
             raise IndexError(f"Index {idx} out of bounds {len(self)}.")
@@ -901,12 +935,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
                     error=err,
                 )
                 location = self._locate_sample(sample_idx)
-                logger.warning(
-                    f"Error loading sample {sample_idx} ({location}) "
-                    f"(attempt {attempt}). "
-                    "Retrying with a random index. "
-                    f"Error: {err}"
-                )
+                self._warn_sample_retry("loading", sample_idx, location, attempt, err)
                 sample_idx = self._resample_random_idx()
         else:
             last_location = self._locate_sample(sample_idx)
@@ -1014,10 +1043,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
                     error=err,
                 )
                 location = self._locate_sample(sample_idx)
-                logger.warning(
-                    f"Error building sample {sample_idx} ({location}) "
-                    f"(attempt {attempt}). Retrying with a random index. Error: {err}"
-                )
+                self._warn_sample_retry("building", sample_idx, location, attempt, err)
                 sample_idx = self._resample_random_idx()
                 lerobot_sample = self.multi_dataset[sample_idx]
 

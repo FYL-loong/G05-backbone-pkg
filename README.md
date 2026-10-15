@@ -90,6 +90,56 @@ UV_PYTHON_INSTALL_MIRROR= bash start.sh
 
 **这 12 个包里任何一个编译失败，整个 `uv sync` 都会失败**（即使其中多数是仿真依赖、实际训练用不到）。
 
+### ⚠️ 视频解码：FFmpeg 与 `G05_VIDEO_BACKEND`
+
+数据集里的 MP4 需要解码。上游代码的选择逻辑**有缺陷**（已在本包修复）：
+
+```python
+# 上游 video_utils.py
+if importlib.util.find_spec("torchcodec"):   # 只检查 python 包能否 import
+    return "torchcodec"                      # 没检查系统 FFmpeg 共享库
+```
+
+`torchcodec` 是 FFmpeg 的绑定，**运行期需要系统 ffmpeg**（官方 `README.md` 也把它列为安装前提）。
+容器里没装时会退化成一堆 WARNING **但不报错、不退出**：
+
+```
+libtorchcodec: we tried to load ... Likely causes: 1. FFmpeg is not properly installed ...
+libavutil.so.56/57/58/59: cannot open shared object file: No such file or directory
+WARNING | >> Error loading sample  base_lerobot_dataset.py:904
+  (dataset_dir=.../TASK-YAM-0001_lerobot, local_idx=27039) (attempt 803). Retrying with a random index
+```
+
+实测这一种情况会刷出 60 万行日志、**训练实质毫无进展**，极难发现。
+
+**本包的修复**（`src/g05/data/lerobot/datasets/video_utils.py`）：
+`get_safe_default_codec()` 现在会**真实探测** torchcodec（写一个 8 帧小视频、取 metadata），
+失败就回退到 **`pyav`** —— 而 `av==14.2.0` 已在依赖里，**wheel 自带 FFmpeg 库，不需要系统 ffmpeg**。
+
+| 环境变量 | 作用 |
+|---|---|
+| `G05_VIDEO_BACKEND=pyav` | 强制用 pyav（最稳，无需系统 ffmpeg） |
+| `G05_VIDEO_BACKEND=torchcodec` | 强制用 torchcodec（需系统 ffmpeg 已装好） |
+| 不设 | 自动探测；torchcodec 不可用则回退 pyav |
+
+**若想用 torchcodec**（更快），在镜像里装系统 ffmpeg 即可：`apt-get install -y ffmpeg`。
+
+### 日志量控制（平台下载有 100 万行上限）
+
+平台日志下载**上限 100 万行**。实测一次坏掉的运行产生了 **3000 万行**以上，
+真正的报错被彻底淹没。本包做了三层控制：
+
+| 措施 | 效果 |
+|---|---|
+| **① 修视频解码**（上面那节） | 消除 ~98% 的日志 —— 那些行全部来自同一个 FFmpeg 错误 |
+| **② 样本加载失败告警节流** | 单样本 10,000 次打点 → 21 次（**降 99.79%**）；第 1 次与最后一次仍完整打印 |
+| **③ 压掉库噪音** | `NCCL_DEBUG=WARN`（去掉几百行拓扑 INFO）、`TQDM_MININTERVAL=10`、`PYTHONWARNINGS=ignore` |
+
+**节流代码**在 `src/g05/data/base_lerobot_dataset.py` 的 `_warn_sample_retry()`：
+失败是系统性的时候（例如缺 ffmpeg），`MAX_GETITEM_ATTEMPT=10000` 会让每个样本
+刷 1 万条、每条还内嵌一大段异常。现在改为**第 1 次完整打印、之后每 500 次打一条摘要、
+最后一次完整打印** —— 既省日志又不丢关键信息。
+
 ### 一条命令（全自动，无人值守）
 
 平台任务的「执行命令」框里填这一条 —— **不需要任何 MODE 参数**：
@@ -108,7 +158,7 @@ bash start.sh
 
 | 阶段 | 内容 | 失败行为 |
 |---|---|---|
-| preflight | token / GPU 显存 / 磁盘 / **网络探测** | 非零退出 |
+| preflight | token / **包完整性检查** / GPU 显存 / 磁盘 | 非零退出 |
 | setup | `uv sync` → 拉 11.5GB 权重（带字节校验）→ 拉 10 个任务数据集 → stats 自检 | 非零退出 |
 | L1 | `--dry-run` 配置组装 | 非零退出 |
 | L2 | `--test` 数据管线 + forward/backward（权重随机初始化） | 非零退出 |
@@ -116,10 +166,18 @@ bash start.sh
 | L4 | 单批过拟合（`--overfit_batch 5`，loss 应明显下降） | 非零退出 |
 | train | 正式训练（后台，卡数自动探测） | — |
 | 守护上传 | 训练启动后自动拉起 `upload_checkpoints.sh MODE=watch`，每 10 分钟把新 checkpoint 推到 HF | — |
-| 等待 + 收尾 | 阻塞等训练结束 → 等 120s 落盘 → 停守护 → **自动上传权重/日志/配置/环境快照** | — |
+| 等待 + 收尾 | 阻塞等训练结束 → 等 120s 落盘 → 停守护 → **自动上传最终权重到 HF** | — |
 
-**任何阶段失败都会自动把诊断上传到 HF**（`diagnostics/<阶段>_<时间戳>/`），
-容器销毁后仍可事后排查。下载与安装步骤都带重试（各 3 次，间隔 60s）。
+**日志由平台负责**：百度百舸自带日志下载功能，本包**不自己收集/上传日志**。
+下载与安装步骤都带重试（各 3 次，间隔 60s）。
+
+**职责边界**：
+
+| 产物 | 去处 | 原因 |
+|---|---|---|
+| **权重**（`model_state_dict.pt` / `checkpoints/step_*.pt`） | **HF** | 容器临时销毁，平台只留日志、不留权重；11.44GB 也超过 GitHub 限制 |
+| **日志** | **平台** | 平台自带下载 |
+| **代码/脚本/配置** | **GitHub** | — |
 
 ### 只跑部分阶段（调试用）
 
@@ -151,7 +209,7 @@ MODE=setup bash start.sh
 
 | 检查 | 期望输出 |
 |---|---|
-| 网络探测 | 5 行全 `[ OK ] 可达` |
+| 包完整性 | `[ OK ] 包完整性通过`（155 条 g05 import 全部可解析） |
 | Python 3.10 获取 | `[env] ✅ 已找到` 或 联网下载成功 |
 | `uv sync`（约 10–30 分钟） | `[env] venv python: Python 3.10.x` |
 | torch 可用性 | `torch 2.7.1+cu128  cuda=12.8  available=True` |
@@ -160,7 +218,7 @@ MODE=setup bash start.sh
 | 数据集 | 10 个任务，合计 `episodes=991` |
 | stats 自检 | `[ OK ] stats 维度与退化检测全部通过` |
 
-**不验证**（要 8 卡那轮才验）：L1/L2/L3 权重加载、L4 过拟合、训练本身。
+**不验证**（要完整那轮才验）：L1/L2/L3 权重加载、L4 过拟合、训练本身。
 
 ### 可选环境变量
 
@@ -173,34 +231,39 @@ MODE=setup bash start.sh
 | `AUTO_UPLOAD` | `1` | `=0` 关闭守护上传 |
 | `UPLOAD_INTERVAL` | `600` | 守护上传轮询秒数 |
 | `ONLY_TASK` | 空 | 设了就只拉单任务，如 `TASK-YAM-0006` |
+| `G05_VIDEO_BACKEND` | 自动探测 | 视频解码后端：`pyav`（不需系统 ffmpeg）或 `torchcodec`（需系统 ffmpeg） |
+| `KEEPALIVE` | `0` | 收尾后挂起 N 秒再退出，便于进容器查看 |
 
 ### 训练跑起来之后
 
-训练在后台，`start.sh` 会打印 exp 目录。容器销毁后一切丢失，**所以收尾要在同一容器内做**：
+`start.sh` 会**阻塞等训练结束并自动上传权重**，所以正常情况下你不需要手动做什么。
 
 ```bash
-EXP=$(cat /workspace/exp_dir.txt)
+EXP=$(cat /workspace/exp_dir.txt)          # start.sh 写好的 exp 目录
 
-# 看训练进度
-tail -f /workspace/train.stdout.log
-# 看上传进度
-tail -f /workspace/upload_checkpoints.log
+tail -f /workspace/train.stdout.log        # 跟训练进度（或直接用平台日志下载）
+tail -f /workspace/upload_checkpoints.log  # 跟守护上传进度
 
-# open-loop 评测（跑完再执行）
-bash scripts/run/eval_open_loop.sh \
-  --ckpt_path $EXP/last.pt --task_config configs/task/yam.yaml
-
-# 最终收尾上传
-EXP_DIR=$EXP bash upload_output.sh
-```
-
-手动上传 checkpoint（守护进程没起来时用）：
-
-```bash
+# 手动上传 checkpoint（守护进程没起来时用）
 EXP_DIR=$EXP bash upload_checkpoints.sh            # 传全部
 DRY_RUN=1 EXP_DIR=$EXP bash upload_checkpoints.sh  # 先看会传什么
 MODE=last EXP_DIR=$EXP bash upload_checkpoints.sh  # 只传最后一个
+
+# 手动上传最终权重
+EXP_DIR=$EXP bash upload_output.sh
+
+# open-loop 评测（趁容器还在）
+bash scripts/run/eval_open_loop.sh \
+  --ckpt_path $EXP/last.pt --task_config configs/task/yam.yaml
 ```
+
+### 排查用的开关
+
+| 变量 | 作用 |
+|---|---|
+| `KEEPALIVE=1800` | 收尾后挂起 N 秒再退出 —— 方便在任务结束前进容器查看 |
+
+**日志**：平台自带下载功能；容器还活着时也可 `tail -f /workspace/train.stdout.log`。
 
 ### 为什么 L2 和 L3 必须分开
 

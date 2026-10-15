@@ -16,6 +16,7 @@
 import glob
 import importlib
 import logging
+import os
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,14 +32,77 @@ from PIL import Image
 import tempfile
 import shutil
 
-def get_safe_default_codec():
-    if importlib.util.find_spec("torchcodec"):
-        return "torchcodec"
-    else:
+# 探测结果进程级缓存：get_safe_default_codec() 可能被每个 DataLoader worker 调用，
+# 而探测要写一个临时小视频，没必要重复做。
+_TORCHCODEC_PROBE_RESULT = None
+
+
+def _torchcodec_really_works() -> bool:
+    """判断 torchcodec 是否【真的能用】，而不只是 python 包能 import。
+
+    上游原实现只做 `importlib.util.find_spec("torchcodec")` —— 只要包装上了就选它。
+    但 torchcodec 是 FFmpeg 的绑定，**运行期需要系统 FFmpeg 共享库**
+    （libavutil.so.56/57/58/59 …）。容器里没装系统 ffmpeg 时会出现：
+
+        libtorchcodec: we tried to load ... runtime dependency ...
+        libavutil.so.58: cannot open shared object file: No such file or directory
+        Likely causes: 1. FFmpeg is not properly installed ...
+
+    于是每个样本解码都失败，训练退化成不停地
+    "Error loading sample ... Retrying with a random index"（实测刷了 60 万行日志、
+    训练毫无进展），而且【不报错、不退出】，极难发现。
+
+    所以这里做一次真实的加载探测：能拿到 metadata 才算可用。结果缓存到进程级。
+    """
+    global _TORCHCODEC_PROBE_RESULT
+    if _TORCHCODEC_PROBE_RESULT is not None:
+        return _TORCHCODEC_PROBE_RESULT
+
+    if importlib.util.find_spec("torchcodec") is None:
+        _TORCHCODEC_PROBE_RESULT = False
+        return False
+    try:
+        import numpy as np
+        import torch
+
+        from torchcodec.decoders import VideoDecoder
+
+        # 小段随机视频：只为触发原生库加载（libtorchcodec / libav*），不关心内容
+        rng = np.random.default_rng(0)
+        frames = rng.integers(0, 255, size=(8, 32, 32, 3), dtype=np.uint8)
+        tmp = tempfile.mkdtemp(prefix="tc_probe_")
+        path = os.path.join(tmp, "probe.mp4")
+        try:
+            torchvision.io.write_video(path, torch.from_numpy(frames), fps=8)
+            _ = VideoDecoder(path, device="cpu").metadata
+            _TORCHCODEC_PROBE_RESULT = True
+            return True
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    except Exception as e:  # noqa: BLE001 - 任何异常都视为不可用
         logging.warning(
-            "'torchcodec' is not available in your platform, falling back to 'pyav' as a default decoder"
+            "torchcodec 已安装但【无法使用】（缺少系统 FFmpeg 共享库？）：%s: %s\n"
+            "  → 回退到 pyav 解码器（av 包自带 FFmpeg，无需系统库）。",
+            type(e).__name__, str(e).split("\n")[0][:200],
         )
-        return "pyav"
+        _TORCHCODEC_PROBE_RESULT = False
+        return False
+
+
+def get_safe_default_codec():
+    # 允许显式指定，便于绕开探测开销或强制某个后端
+    forced = os.environ.get("G05_VIDEO_BACKEND", "").strip().lower()
+    if forced:
+        logging.info("使用 G05_VIDEO_BACKEND=%s 指定的视频解码后端", forced)
+        return forced
+
+    if _torchcodec_really_works():
+        return "torchcodec"
+
+    logging.warning(
+        "'torchcodec' 不可用，回退到 'pyav' 解码器（torchvision 的 pyav 后端）"
+    )
+    return "pyav"
 
 
 def decode_video_frames(

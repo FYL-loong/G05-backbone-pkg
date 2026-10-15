@@ -2,10 +2,9 @@
 # ============================================================================
 # start.sh — G0.5 backbone 微调一键启动（百度百舸 AIHC，无人值守）
 #
-# 一条命令跑完：
-#   装环境 -> 拉权重/数据 -> 自检 -> L1/L2/L3(门禁)/L4 -> 训练 -> 等待结束
-#   -> 自动收尾上传（权重 + 日志 + 环境快照）
-# 任何阶段失败都会自动把诊断信息传到 HF，便于事后排查。
+# 职责只有一件：把微调跑起来、跑完、把权重存到 HF。
+#   - 日志：平台自带下载功能，本脚本不再自己收集/上传日志。
+#   - 权重：容器临时，必须上传 HF，否则训练白跑。
 #
 # 平台「执行命令」框：
 #   set -e
@@ -32,15 +31,12 @@
 #   STRICT_L3         默认 1；=0 时 L3 无法判定也继续（不推荐）
 #   AUTO_UPLOAD       默认 1；=0 关闭 checkpoint 守护上传
 #   UPLOAD_INTERVAL   守护上传轮询秒数，默认 600
+#   KEEPALIVE         可选，收尾后挂起 N 秒再退出（便于进容器查看）
 # ============================================================================
-# 注意：这里【故意不用 pipefail】。
-# 踩过的坑：`nvidia-smi ... | head -1` 这类写法里，下游命令（head）读够就退出，
-# 上游（nvidia-smi/ls/grep）继续写时收到 SIGPIPE → 退出码 141。
-# 在 pipefail 下，整条管道被判为失败 → set -e 直接中止脚本。
-# 8 卡时 nvidia-smi 输出 8 行必现，1 卡只输出 1 行不触发 —— 极难发现。
-# 日志同时用 tee 落到 START_LOG 也是为此；但真正要防的是管道语义，
-# 所以去掉 pipefail，靠 set -e 捕获主命令失败即可。
 set -euo pipefail
+# 故意不用 pipefail：`cmd | head -1` 这类写法里，下游 head 读够就退出，上游
+# 收到 SIGPIPE（退出码 141），pipefail 会把整条管道判为失败 → set -e 中止脚本。
+# 8 卡时 `nvidia-smi | head` 必现、1 卡不出现 —— 极难发现。靠 set -e 捕获主命令即可。
 set +o pipefail
 
 MODE="${MODE:-all}"
@@ -51,18 +47,22 @@ SKIP_L4="${SKIP_L4:-0}"
 STRICT_L3="${STRICT_L3:-1}"
 AUTO_UPLOAD="${AUTO_UPLOAD:-1}"
 UPLOAD_INTERVAL="${UPLOAD_INTERVAL:-600}"
+KEEPALIVE="${KEEPALIVE:-0}"
 export G05_OUTPUT_DIR HF_ENDPOINT
+
+# ------------------------------------------------- 压制日志噪音（平台有行数上限）
+# 平台日志下载有 100 万行上限，而 NCCL 初始化默认会打出几百行拓扑 INFO
+# （Tree/Pattern/GPU-... 之类），完全无用。设为 WARN 后只在真出问题时说话。
+export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+export NCCL_DEBUG_SUBSYS="${NCCL_DEBUG_SUBSYS:-INIT,NET}"
+# tqdm 进度条每步刷新会产生大量行；降低刷新频率（只影响观感，不影响训练）
+export TQDM_MININTERVAL="${TQDM_MININTERVAL:-10}"
+export TQDM_MINITERS="${TQDM_MINITERS:-50}"
+# 关掉 Python 的 DeprecationWarning / FutureWarning 刷屏
+export PYTHONWARNINGS="${PYTHONWARNINGS:-ignore}"
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_ROOT"
-
-# ---------------------------------------------------------------- 日志留存
-# 整个 start.sh 的 stdout 同时写一份到 START_LOG，
-# 失败时 upload_diagnostics.sh 能把它一起传走。
-START_LOG="${START_LOG:-/workspace/start.log}"
-mkdir -p "$(dirname "$START_LOG")" 2>/dev/null || START_LOG="$PROJECT_ROOT/start.log"
-exec > >(tee -a "$START_LOG") 2>&1
-export START_LOG
 
 # ---------------------------------------------------------------- 工具函数
 C_R='\033[31m'; C_G='\033[32m'; C_Y='\033[33m'; C_C='\033[36m'; C_0='\033[0m'
@@ -101,29 +101,7 @@ retry() {
     done
 }
 
-# ---------------------------------------------------------------- 失败处理
-# 任何命令失败（set -e）都触发 ERR，自动把诊断传到 HF —— 容器销毁后这是唯一的现场。
-CURRENT_STAGE="preflight"
 EXP_DIR_FOUND=""
-on_error() {
-    local rc=$? line=${1:-?}
-    printf "\n${C_R}[FAIL]${C_0} start.sh 在第 %s 行失败（退出码 %s），阶段: %s\n" "$line" "$rc" "$CURRENT_STAGE"
-    printf "${C_R}[FAIL]${C_0} 正在上传诊断信息到 HF ...\n"
-    STAGE="$CURRENT_STAGE" \
-    START_LOG="$START_LOG" \
-    EXP_DIR="${EXP_DIR_FOUND:-}" \
-    EXTRA_FILES="/workspace/train.stdout.log /workspace/upload_checkpoints.log" \
-    bash "$PROJECT_ROOT/upload_diagnostics.sh" || true
-    printf "${C_Y}[WARN]${C_0} 诊断上传结束。现场仍在本容器内：%s\n" "$START_LOG"
-    exit "$rc"
-}
-trap 'on_error $LINENO' ERR
-
-# 标记阶段并打印标题（阶段名会出现在 diagnostics/<名字>_<时间戳>/ 里）
-run_stage() {
-    CURRENT_STAGE="$1"
-    step "$1. $2"
-}
 
 # ---------------------------------------------------------------- 前置检查
 step "0. 前置检查"
@@ -137,13 +115,11 @@ info "G05_OUTPUT_DIR = $G05_OUTPUT_DIR"
 info "HF_ENDPOINT    = $HF_ENDPOINT"
 info "ONLY_TASK      = ${ONLY_TASK:-<全部 10 个任务>}"
 
-# ---- 包完整性门禁（几秒钟，但能避免白跑一次 GPU 队列）----
-# 踩过的坑：.gitignore 里写了裸目录名 `eval/`，把官方源码目录
-# src/g05/utils/eval/ 一起忽略了 → 文件从未 push → 容器里
-# `import g05.utils.eval` 失败（finetune.py:451）。而 MODE=setup 只下载
-# 权重和数据、不 import 模型代码，所以发现不了，一直要跑到 L1 才崩。
+# ---- 包完整性门禁 ----
+# 便宜（几秒）且抓到过真 bug：.gitignore 写了裸目录名 `eval/`，把官方源码目录
+# src/g05/utils/eval/ 一起忽略 → 文件从未 push → 容器里 import 失败，
+# 而 setup 阶段只下载权重和数据、不 import 模型代码，发现不了，要跑到 L1 才崩。
 if [[ -f check_package.py ]]; then
-    CURRENT_STAGE="preflight:package-check"
     info "包完整性检查（g05.* import 是否都能解析）..."
     if python check_package.py .; then
         ok "包完整性通过"
@@ -157,10 +133,7 @@ fi
 if nvidia-smi >/dev/null 2>&1; then
     info "GPU:"
     nvidia-smi --query-gpu=name,memory.total,memory.used --format=csv,noheader | sed 's/^/       /'
-    # ⚠️ 不要写 `nvidia-smi ... | head -1`：nvidia-smi 输出 N 行而 head 读 1 行就退出，
-    #    nvidia-smi 会收到 SIGPIPE（退出码 141），在 `set -o pipefail` + `set -e` 下
-    #    会直接中止脚本。1 卡时输出只有 1 行不会触发，8 卡时必现。
-    #    这里改成先把全部输出读进内存，再用 awk 取第一行 —— 没有任何提前关闭的管道。
+    # 不要写 `nvidia-smi ... | head -1`（见文件顶部关于 SIGPIPE 的说明）
     GPU_TOTAL_MB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits \
         | awk 'NR==1{gsub(/[^0-9]/,""); print; exit}')"
     if [[ "${GPU_TOTAL_MB:-0}" -lt 70000 ]]; then
@@ -174,49 +147,18 @@ fi
 
 mkdir -p "$G05_OUTPUT_DIR"
 df -h "$G05_OUTPUT_DIR" | tail -1 | sed 's/^/       /'
-AVAIL_GB="$(df -BG "$G05_OUTPUT_DIR" | tail -1 | awk '{print $4}' | tr -d 'G')"
-if [[ "${AVAIL_GB:-0}" -lt 60 ]]; then
-    warn "可用磁盘 ${AVAIL_GB}G 偏小（11GB 权重 + 每个 checkpoint 11.44GB）"
-fi
-
-# ---- 网络探测：setup 阶段要访问这些域名，提前暴露问题 ----
-# 实测（2026-03）：github.com 在国内常不可达，而 uv 默认从 GitHub Releases 下载
-# Python 3.10（NGC 镜像自带 3.12，不满足 requires-python >=3.10.16,<3.11）。
-probe() {
-    local host="$1" what="$2"
-    if timeout 12 bash -c "exec 3<>/dev/tcp/$host/443" 2>/dev/null; then
-        ok "  可达   $host   ($what)"
-        return 0
-    fi
-    warn "  不可达 $host   ($what)"
-    return 1
-}
-info "网络探测（setup 阶段要访问的域名）:"
-probe mirrors.aliyun.com   "uv.lock 里 1049 个包" || true
-probe download.pytorch.org "torch cu128 轮子" || true
-probe pypi.nvidia.com      "nvidia 依赖" || true
-probe astral.sh            "安装 uv" || true
-if ! probe gh-proxy.com "Python 3.10 下载镜像（默认启用）"; then
-    warn "  gh-proxy 不可达 → 若本地没有 Python 3.10，uv sync 会失败。"
-    warn "  备选：UV_PYTHON_INSTALL_MIRROR=<其它镜像> 或 UV_PYTHON_INSTALL_MIRROR= （走官方源）"
-fi
 
 # ============================================================================
 # setup：装环境 + 拉权重 + 拉数据 + 自检
 # ============================================================================
 do_setup() {
-    run_stage setup-install "安装环境（uv sync，首次约 10-30 分钟）"
+    step "1. 安装环境（uv sync，首次约 10-30 分钟）"
     # NGC 镜像自带 Python 3.12，但项目要求 3.10.16（.python-version / requires-python），
-    # 所以 uv 必须联网下载一个独立 Python 3.10 —— 源默认是 GitHub Releases，
-    # 国内不可靠。这里默认启用国内镜像；若它不通，用
-    #   UV_PYTHON_INSTALL_MIRROR= bash start.sh    回退官方源
+    # 所以 uv 必须联网下载独立 Python 3.10 —— 源默认是 GitHub Releases，国内不可靠。
     if [[ -z "${UV_PYTHON_INSTALL_MIRROR+x}" ]]; then
         export UV_PYTHON_INSTALL_MIRROR="https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone/releases/download"
         info "启用 Python 下载镜像: $UV_PYTHON_INSTALL_MIRROR"
-    else
-        info "UV_PYTHON_INSTALL_MIRROR = ${UV_PYTHON_INSTALL_MIRROR:-<空，走官方 GitHub>}"
     fi
-    # torch cu128 wheel 数百 MB，默认超时可能不够
     export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-300}"
 
     if [[ -x .venv/bin/python ]]; then
@@ -227,22 +169,21 @@ do_setup() {
     activate_venv
     python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'avail', torch.cuda.is_available())"
 
-    run_stage download-weights "下载权重（约 11.5GB，实测约 3 分钟；失败自动重试 3 次）"
+    step "2. 下载权重（约 11.5GB，失败自动重试 3 次）"
     retry 3 60 bash download_weights.sh
 
-    run_stage download-dataset "下载数据集（失败自动重试 3 次）"
+    step "3. 下载数据集（失败自动重试 3 次）"
     if [[ -n "$ONLY_TASK" ]]; then
         retry 3 60 env ONLY_TASK="$ONLY_TASK" bash download_dataset.sh
     else
         retry 3 60 bash download_dataset.sh
     fi
 
-    run_stage data-check "数据完整性自检"
+    step "4. 数据完整性自检"
     local n_ds
     n_ds="$(find data/yam -maxdepth 1 -type d -name 'TASK-YAM-*_lerobot' 2>/dev/null | wc -l | tr -d ' ')"
     info "发现 $n_ds 个 _lerobot 数据集"
     [[ "$n_ds" -gt 0 ]] || fail "data/yam 下没有 TASK-YAM-*_lerobot，数据集没拉下来"
-    # 用 heredoc 而不是 python -c，避免 $ 与引号在 bash 里层层转义
     python - <<'PY'
 import glob, json, os
 dirs = sorted(glob.glob("data/yam/TASK-YAM-*_lerobot"))
@@ -261,7 +202,7 @@ if tot == 0:
     raise SystemExit("[FAIL] 所有数据集 episode 数都是 0，数据有问题")
 PY
 
-    run_stage stats-check "stats 自检（维度 + 退化检测）"
+    step "5. stats 自检（维度 + 退化检测）"
     python - <<'PY'
 import json, os, sys
 p = "data/stats/yam_stats.json"
@@ -307,23 +248,23 @@ PY
 do_verify() {
     activate_venv
 
-    run_stage L1-config "L1 配置组装（不加载权重、不占显存）"
+    step "L1 配置组装（不加载权重、不占显存）"
     bash scripts/run/finetune.sh 1 yam --dry-run --max_datasets 1
     ok "L1 通过"
 
-    run_stage L2-pipeline "L2 数据管线 + forward/backward（权重随机初始化，不验证权重加载）"
+    step "L2 数据管线 + forward/backward（权重随机初始化，不验证权重加载）"
     bash scripts/run/finetune.sh 1 yam --test --max_datasets 1 \
         model.pretrained_ckpt=null model.max_steps=10 logger.mode=offline
     ok "L2 通过（数据管线没崩）"
 
-    run_stage L3-weight-load "L3 ★ 权重加载验证（11GB 加载；脚本自动判定并返回门禁退出码）"
+    step "L3 ★ 权重加载验证（11GB 加载；脚本自动判定并返回门禁退出码）"
     STRICT="$STRICT_L3" bash verify_weight_load.sh
     ok "L3 通过（权重完整加载）"
 
     if [[ "$SKIP_L4" == "1" ]]; then
         warn "SKIP_L4=1，跳过 L4"
     else
-        run_stage L4-overfit "L4 单批过拟合（loss 应明显下降）"
+        step "L4 单批过拟合（loss 应明显下降）"
         bash scripts/run/finetune.sh 1 yam --overfit_batch 5 model.max_steps=500 \
             logger.mode=offline
         ok "L4 跑完（请确认上面 loss 明显下降）"
@@ -331,7 +272,7 @@ do_verify() {
 }
 
 # ============================================================================
-# train：正式训练（后台）+ 守护上传 + 等待结束 + 收尾上传
+# train：正式训练 + 守护上传 + 等待结束 + 收尾上传权重
 # ============================================================================
 do_train() {
     activate_venv
@@ -341,16 +282,14 @@ do_train() {
     info "GPU 数: $n（来源: GPUS / NPROC_PER_NODE / MLP_WORKER_GPU / MLP_WORKER_NUM / nvidia-smi）"
     info "注意：batch_size 是每卡的，全局 batch = batch_size × $n"
 
-    run_stage train-launch "启动正式训练（后台，日志 -> /workspace/train.stdout.log）"
+    step "启动正式训练（后台 -> /workspace/train.stdout.log）"
     nohup bash scripts/run/finetune.sh "$n" yam logger.mode=offline \
         > /workspace/train.stdout.log 2>&1 &
     local pid=$!
     echo "$pid" > /workspace/train.pid
     ok "训练 PID=$pid（已写入 /workspace/train.pid）"
 
-    # 等 exp 目录出现（最多 5 分钟）
-    # ⚠️ 不用 `ls ... | head -1`：ls 输出多行时 head 提前退出会让 ls 收到 SIGPIPE。
-    #    改用 mapfile 先全部读入，再取第一个。
+    # 等 exp 目录出现（最多 5 分钟）。不用 `ls | head -1`（会触发 SIGPIPE）
     local exp="" i=0 _dirs=()
     while [[ $i -lt 30 ]]; do
         sleep 10; i=$((i+1))
@@ -369,14 +308,14 @@ do_train() {
         warn "5 分钟内没识别出 exp 目录。稍后手动：ls $G05_OUTPUT_DIR/yam/"
     fi
 
-    # 守护上传：训练中陆续把 checkpoint 推到 HF
+    # 守护上传：训练中陆续把 checkpoint 推到 HF（容器销毁后的唯一备份）
     if [[ "$AUTO_UPLOAD" == "1" && -n "$exp" ]]; then
-        run_stage upload-daemon "启动 checkpoint 守护上传（每 ${UPLOAD_INTERVAL}s 轮询）"
+        step "启动 checkpoint 守护上传（每 ${UPLOAD_INTERVAL}s 轮询一次）"
         nohup env MODE=watch EXP_DIR="$exp" WATCH_INTERVAL="$UPLOAD_INTERVAL" \
             HF_TOKEN="$HF_TOKEN" HF_ENDPOINT="$HF_ENDPOINT" \
             bash upload_checkpoints.sh > /workspace/upload_checkpoints.log 2>&1 &
         echo $! > /workspace/upload.pid
-        ok "守护上传 PID=$(cat /workspace/upload.pid)  日志 /workspace/upload_checkpoints.log"
+        ok "守护上传 PID=$(cat /workspace/upload.pid)"
     elif [[ "$AUTO_UPLOAD" != "1" ]]; then
         warn "AUTO_UPLOAD=0，未启动守护上传"
     fi
@@ -388,17 +327,14 @@ do_train() {
     cat <<EOF
 
 ============================================================
- 训练在后台跑。start.sh 会【阻塞等待训练结束】，然后自动收尾上传。
-============================================================
- 训练日志 : tail -f /workspace/train.stdout.log
- 上传日志 : tail -f /workspace/upload_checkpoints.log
- exp 目录 : ${exp:-<未识别>}
+ 训练在后台跑。start.sh 会【阻塞等待训练结束】，然后自动上传权重。
+ 日志：平台自带下载功能可直接取；也可 tail -f /workspace/train.stdout.log
+ exp 目录：${exp:-<未识别>}
 ============================================================
 EOF
 
     # ------------------------------------------------------------ 等待训练结束
-    CURRENT_STAGE="train-running"
-    step "train-running. 等待训练结束（PID=$pid）"
+    step "等待训练结束（PID=$pid）"
     local waited=0
     while kill -0 "$pid" 2>/dev/null; do
         sleep 60
@@ -411,13 +347,12 @@ EOF
     done
     ok "训练进程已退出（累计等待 $((waited/60)) 分钟）"
 
-    # 等最终 checkpoint 落盘（finetune.py:1329 保存后进程才退出，IO 可能仍在 flush）
+    # 等最终 checkpoint 落盘（finetune.py 保存后进程才退出，IO 可能仍在 flush）
     info "等 120s 让最终 checkpoint 落盘..."
     sleep 120
 
     if [[ -z "$exp" ]]; then
         warn "没有 exp 目录，跳过收尾上传。请手动："
-        echo "     EXP_DIR=<exp目录> bash upload_checkpoints.sh"
         echo "     EXP_DIR=<exp目录> bash upload_output.sh"
         return 0
     fi
@@ -428,34 +363,29 @@ EOF
         sleep 5
     fi
 
-    run_stage final-checkpoints "收尾上传所有 checkpoint"
+    step "收尾上传 checkpoint"
     MODE=all EXP_DIR="$exp" bash upload_checkpoints.sh || warn "checkpoint 收尾上传失败，可重跑"
 
-    run_stage final-artifacts "收尾上传最终产物（权重 / 日志 / 配置 / 环境快照）"
-    EXP_DIR="$exp" bash upload_output.sh || warn "产物收尾上传失败，可重跑"
+    step "收尾上传最终权重"
+    EXP_DIR="$exp" bash upload_output.sh || warn "权重收尾上传失败，可重跑：EXP_DIR=$exp bash upload_output.sh"
 
-    step "本容器内全部完成"
+    step "全部完成"
     cat <<EOF
 
 ============================================================
- 结果查看位置
+ 权重已上传：https://huggingface.co/Zenith6666/yam-backbone
+   - model_state_dict.pt        最终权重
+   - checkpoints/step_*.pt      各 step checkpoint
+   - hydra_config.yaml / dataset_stats.json / action_tokenizer.pt
+ 容器内还留着的（销毁即失）：
+   $exp/last.pt
 ============================================================
- 1) HF 权重仓库（推荐；容器销毁后唯一可靠的地方）
-      https://huggingface.co/Zenith6666/yam-backbone
-      - model_state_dict.pt    最终权重
-      - checkpoints/step_*.pt  各 step checkpoint
-      - train.log / finetune.jsonl / logs/   日志与指标
-      - hydra_config.yaml / env_report.txt   配置与环境快照
- 2) 容器内日志（销毁即失）
-      /workspace/train.stdout.log
-      $exp/train.log
-      $exp/finetune.jsonl
- 3) 若失败：diagnostics/<阶段>_<时间戳>/ 下有启动日志与环境快照
-
- 趁容器还在，可跑 open-loop 评测：
-   bash scripts/run/eval_open_loop.sh \\
-     --ckpt_path $exp/last.pt --task_config configs/task/yam.yaml
 EOF
+
+    if [[ "${KEEPALIVE:-0}" -gt 0 ]]; then
+        info "KEEPALIVE=${KEEPALIVE}s，挂起以便进容器查看..."
+        sleep "$KEEPALIVE"
+    fi
 }
 
 # ---------------------------------------------------------------- 分发
