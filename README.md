@@ -186,13 +186,24 @@ ValueError: Operation creation failed
 
 ```bash
 set -e
-export HF_TOKEN="hf_你的token"
+export HF_TOKEN="hf_把你的真实token填这里"
+export G05_VIDEO_BACKEND=pyav
 git clone https://github.com/FYL-loong/G05-backbone-pkg.git G05-backbone-pkg
 cd G05-backbone-pkg
 bash start.sh
 ```
 
-`HF_TOKEN` 写在执行命令里（平台环境变量栏存不了），**不要写进任何文件** —— 那会被 `git push` 上去。
+**关于这两行 `export`（只有这两个需要你写）**：
+
+| 变量 | 必需？ | 说明 |
+|---|---|---|
+| **`HF_TOKEN`** | ★ **必需** | 留空/不设 → `start.sh` 前置检查**立刻失败**（否则训练完权重传不上去，容器一销毁全丢）。写在执行命令里，**不要写进任何文件**（会被 push 上去） |
+| `G05_VIDEO_BACKEND` | 可选 | `pyav` 可省掉自动探测、直接走 pyav。**不写也能跑**（自动探测失败会回退 pyav） |
+
+**不要**再手动设 `G05_VISION_ATTN` —— `start.sh` 已默认导出 `sdpa`（原因见上面那节）。
+其余变量（`MODE` / `AUTO_UPLOAD` / `UPLOAD_INTERVAL` / `KEEPALIVE` / `ONLY_TASK` /
+`SKIP_L4` / `STRICT_L3` / `HF_ENDPOINT` / `G05_OUTPUT_DIR`）都在脚本内有默认值，
+见「可选环境变量」一节，一般不用指定。
 
 `bash start.sh`（等价 `MODE=all`）会依次自动执行：
 

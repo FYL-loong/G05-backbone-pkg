@@ -6,12 +6,17 @@
 #   - 日志：平台自带下载功能，本脚本不再自己收集/上传日志。
 #   - 权重：容器临时，必须上传 HF，否则训练白跑。
 #
-# 平台「执行命令」框：
+# 平台「执行命令」框 —— 复制这段，只改 HF_TOKEN：
+#
 #   set -e
-#   export HF_TOKEN="hf_xxxx"
+#   export HF_TOKEN="hf_把你的真实token填这里"     # ★ 唯一必需；留空会立刻失败
+#   export G05_VIDEO_BACKEND=pyav                 # 可选（省掉自动探测；不写也能跑）
 #   git clone https://github.com/FYL-loong/G05-backbone-pkg.git G05-backbone-pkg
 #   cd G05-backbone-pkg
 #   bash start.sh
+#
+# 【不要】额外设 G05_VISION_ATTN —— 本脚本 L75 已默认导出 sdpa。
+# 其余带默认值的变量见下方「环境变量」段，一般不需要手动指定。
 #
 # 分阶段（调试用）：
 #   MODE=setup   bash start.sh    装环境 + 拉权重/数据 + 自检
