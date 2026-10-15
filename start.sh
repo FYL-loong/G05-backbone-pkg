@@ -137,6 +137,23 @@ info "G05_OUTPUT_DIR = $G05_OUTPUT_DIR"
 info "HF_ENDPOINT    = $HF_ENDPOINT"
 info "ONLY_TASK      = ${ONLY_TASK:-<全部 10 个任务>}"
 
+# ---- 包完整性门禁（几秒钟，但能避免白跑一次 GPU 队列）----
+# 踩过的坑：.gitignore 里写了裸目录名 `eval/`，把官方源码目录
+# src/g05/utils/eval/ 一起忽略了 → 文件从未 push → 容器里
+# `import g05.utils.eval` 失败（finetune.py:451）。而 MODE=setup 只下载
+# 权重和数据、不 import 模型代码，所以发现不了，一直要跑到 L1 才崩。
+if [[ -f check_package.py ]]; then
+    CURRENT_STAGE="preflight:package-check"
+    info "包完整性检查（g05.* import 是否都能解析）..."
+    if python check_package.py .; then
+        ok "包完整性通过"
+    else
+        fail "包完整性检查失败 —— 见上方缺失模块清单（这是【代码缺文件】，不是环境问题）"
+    fi
+else
+    warn "没有 check_package.py，跳过包完整性检查"
+fi
+
 if nvidia-smi >/dev/null 2>&1; then
     info "GPU:"
     nvidia-smi --query-gpu=name,memory.total,memory.used --format=csv,noheader | sed 's/^/       /'
