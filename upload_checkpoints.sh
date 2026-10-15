@@ -39,6 +39,7 @@
 #       > /workspace/upload_checkpoints.log 2>&1 &
 # ============================================================================
 set -euo pipefail
+set +o pipefail    # 见 start.sh 顶部注释：避免 | head 触发 SIGPIPE(141) 中止
 
 HF_REPO_ID="${HF_REPO_ID:-Zenith6666/yam-backbone}"
 HF_TOKEN="${HF_TOKEN:?请设置 HF_TOKEN（HF 写权限 token）}"

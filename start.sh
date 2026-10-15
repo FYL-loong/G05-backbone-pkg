@@ -33,7 +33,15 @@
 #   AUTO_UPLOAD       默认 1；=0 关闭 checkpoint 守护上传
 #   UPLOAD_INTERVAL   守护上传轮询秒数，默认 600
 # ============================================================================
+# 注意：这里【故意不用 pipefail】。
+# 踩过的坑：`nvidia-smi ... | head -1` 这类写法里，下游命令（head）读够就退出，
+# 上游（nvidia-smi/ls/grep）继续写时收到 SIGPIPE → 退出码 141。
+# 在 pipefail 下，整条管道被判为失败 → set -e 直接中止脚本。
+# 8 卡时 nvidia-smi 输出 8 行必现，1 卡只输出 1 行不触发 —— 极难发现。
+# 日志同时用 tee 落到 START_LOG 也是为此；但真正要防的是管道语义，
+# 所以去掉 pipefail，靠 set -e 捕获主命令失败即可。
 set -euo pipefail
+set +o pipefail
 
 MODE="${MODE:-all}"
 G05_OUTPUT_DIR="${G05_OUTPUT_DIR:-/workspace/output}"
@@ -132,7 +140,12 @@ info "ONLY_TASK      = ${ONLY_TASK:-<全部 10 个任务>}"
 if nvidia-smi >/dev/null 2>&1; then
     info "GPU:"
     nvidia-smi --query-gpu=name,memory.total,memory.used --format=csv,noheader | sed 's/^/       /'
-    GPU_TOTAL_MB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1 | tr -d ' ')"
+    # ⚠️ 不要写 `nvidia-smi ... | head -1`：nvidia-smi 输出 N 行而 head 读 1 行就退出，
+    #    nvidia-smi 会收到 SIGPIPE（退出码 141），在 `set -o pipefail` + `set -e` 下
+    #    会直接中止脚本。1 卡时输出只有 1 行不会触发，8 卡时必现。
+    #    这里改成先把全部输出读进内存，再用 awk 取第一行 —— 没有任何提前关闭的管道。
+    GPU_TOTAL_MB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits \
+        | awk 'NR==1{gsub(/[^0-9]/,""); print; exit}')"
     if [[ "${GPU_TOTAL_MB:-0}" -lt 70000 ]]; then
         warn "单卡显存 ${GPU_TOTAL_MB} MiB < 70 GB，全参微调可能 OOM"
     else
@@ -319,11 +332,17 @@ do_train() {
     ok "训练 PID=$pid（已写入 /workspace/train.pid）"
 
     # 等 exp 目录出现（最多 5 分钟）
-    local exp="" i=0
+    # ⚠️ 不用 `ls ... | head -1`：ls 输出多行时 head 提前退出会让 ls 收到 SIGPIPE。
+    #    改用 mapfile 先全部读入，再取第一个。
+    local exp="" i=0 _dirs=()
     while [[ $i -lt 30 ]]; do
         sleep 10; i=$((i+1))
-        exp="$(ls -1dt "$G05_OUTPUT_DIR"/yam/*/ 2>/dev/null | head -1 || true)"
-        [[ -n "$exp" ]] && break
+        _dirs=()
+        mapfile -t _dirs < <(ls -1dt "$G05_OUTPUT_DIR"/yam/*/ 2>/dev/null || true)
+        if [[ ${#_dirs[@]} -gt 0 ]]; then
+            exp="${_dirs[0]}"
+            break
+        fi
     done
     if [[ -n "$exp" ]]; then
         ok "本次 exp 目录: $exp"

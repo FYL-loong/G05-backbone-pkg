@@ -25,6 +25,7 @@
 #   2) 2 步跑完，loss 是有限值（非 nan/inf）
 # ============================================================================
 set -euo pipefail
+set +o pipefail    # 见 start.sh 顶部注释：避免 | head 触发 SIGPIPE(141) 中止
 
 GPUS="${GPUS:-1}"
 STEPS="${STEPS:-2}"

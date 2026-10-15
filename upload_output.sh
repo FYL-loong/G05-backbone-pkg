@@ -30,6 +30,7 @@
 #   UPLOAD_ROOT   项目根目录（生成 env_report 用），默认脚本所在目录
 # ============================================================================
 set -euo pipefail
+set +o pipefail    # 见 start.sh 顶部注释：避免 | head 触发 SIGPIPE(141) 中止
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"

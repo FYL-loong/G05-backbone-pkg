@@ -28,6 +28,7 @@
 #    所以本脚本不再建议 mirror；若确实要用，请先确认平台上 curl 得通。
 # ============================================================================
 set -euo pipefail
+set +o pipefail    # 见 start.sh 顶部注释：避免 | head 触发 SIGPIPE(141) 中止
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_ROOT"

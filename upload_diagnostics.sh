@@ -31,7 +31,8 @@
 #   EXP_DIR       可选，若已存在则一并把它的日志纳入
 #   UPLOAD_ROOT   可选，项目根（生成 env_report 用），默认脚本所在目录
 # ============================================================================
-set -uo pipefail    # 注意：故意不用 -e，诊断上传不能因为小错中断
+set -uo pipefail
+set +o pipefail    # 见 start.sh 顶部注释：避免 | head 触发 SIGPIPE(141)    # 注意：故意不用 -e，诊断上传不能因为小错中断
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR" 2>/dev/null || true
@@ -153,8 +154,48 @@ for f in $EXTRA_FILES; do
 done
 
 # 3) 上传
+# ⚠️ 诊断可能在【任何阶段】被调用，包括 preflight（此时 .venv 还不存在，
+#    系统 python 里也没有 huggingface_hub）。实测会报
+#    ModuleNotFoundError: No module named 'huggingface_hub'，导致诊断丢失 ——
+#    而早期失败恰恰最需要诊断。所以这里按优先级挑一个可用的 python，
+#    都没有就现场装一个（仅几十秒，且失败也不影响退出码）。
 info "上传到 $HF_REPO_ID/$DEST/ ..."
-HF_REPO_ID="$HF_REPO_ID" HF_TOKEN="$HF_TOKEN" BUNDLE="$BUNDLE" DEST="$DEST" python - <<'PY' 2>&1 | sed 's/^/  /'
+
+pick_python() {
+    local cands=(
+        "${PROJECT_ROOT:-$SCRIPT_DIR}/.venv/bin/python"
+        "$SCRIPT_DIR/.venv/bin/python"
+        "$(command -v python3 2>/dev/null || true)"
+        "$(command -v python 2>/dev/null || true)"
+    )
+    local c
+    for c in "${cands[@]}"; do
+        [[ -n "$c" && -x "$c" ]] || continue
+        if "$c" -c "import huggingface_hub" >/dev/null 2>&1; then
+            printf '%s' "$c"; return 0
+        fi
+    done
+    # 有 python 但没有 hub：就地装一个
+    for c in "${cands[@]}"; do
+        [[ -n "$c" && -x "$c" ]] || continue
+        warn "在 $c 里安装 huggingface_hub ..."
+        if "$c" -m pip install -q "huggingface_hub" >/dev/null 2>&1 \
+           || "$c" -m pip install -q --break-system-packages "huggingface_hub" >/dev/null 2>&1; then
+            printf '%s' "$c"; return 0
+        fi
+    done
+    return 1
+}
+
+PYBIN="$(pick_python || true)"
+if [[ -z "$PYBIN" ]]; then
+    warn "找不到可用 python / 装不上 huggingface_hub，诊断无法上传"
+    warn "文件仍在容器内：$BUNDLE"
+    exit 0
+fi
+info "使用 python: $PYBIN"
+
+HF_REPO_ID="$HF_REPO_ID" HF_TOKEN="$HF_TOKEN" BUNDLE="$BUNDLE" DEST="$DEST" "$PYBIN" - <<'PY' 2>&1 | sed 's/^/  /'
 import os
 from huggingface_hub import HfApi
 api = HfApi(token=os.environ["HF_TOKEN"])
