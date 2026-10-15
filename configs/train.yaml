@@ -17,13 +17,16 @@ exp_name: "${oc.env:EXP_NAME, ${now:%Y-%m-%d_%H-%M-%S}}"
 output_dir: ${hydra:runtime.output_dir}
 
 # checkpointing
-# 每个 checkpoint 约 11.44GB。官方默认 2000 步，但本任务的训练规模很小
-# （configs/model/g05.yaml: max_epochs=2, batch_size=16 每卡），总步数大约只有
-# 几百到一两千 —— 沿用 2000 会导致【整个训练只在结束时存一次 checkpoint】。
-# 平台容器是临时的，任务被杀/自动停止就全丢，所以调到 500 步。
-# 配 upload_checkpoints.sh 的守护模式定期推到 HF（每 10 分钟轮询）。
-# ⚠️ 注意 batch_size 是【每卡】的：全局 batch = batch_size × 卡数。
-checkpointing_steps: 500
+# 沿用官方默认 2000 步。注意【实际生效】的训练规模来自 configs/task/yam.yaml
+# （它从官方 r1lite.yaml 复制，超参数未改），而不是 configs/model/g05.yaml ——
+# task 的 defaults 里 `_self_` 在最后，所以 task 覆盖 model：
+#     max_epochs = 10, batch_size = 8（每卡）, grad_accumulation_steps = 1
+# 因此总步数可达上万步，2000 步一存是合理密度。
+#
+# ⚠️ 不要随意调小：每个 checkpoint 约 11.44GB，若调成 500 且总步数上万，
+#    会积累几十个文件（几百 GB），而平台容器磁盘约 500GB。
+# ⚠️ batch_size 是【每卡】的：全局 batch = batch_size × 卡数 × grad_accumulation_steps。
+checkpointing_steps: 2000
 
 # eval
 eval_steps: 100

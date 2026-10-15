@@ -28,8 +28,12 @@ dist/
 tmp/
 *.log
 
-# ── 本地工作目录（改包时留的原始文件备份，不入库）──
+# ── 本地工作目录 / 本地产物（不入库）──
+# ⚠️ 必须带前导 `/` 锚定到仓库根目录！
+#    写成裸 `eval/` 会匹配任意层级，把官方源码目录
+#    src/g05/utils/eval/ 也一起忽略掉 —— 曾导致
+#    `ModuleNotFoundError: No module named 'g05.utils.eval'`（finetune.py:451）。
 _original_backup/
-eval/
-finetune.jsonl
+/eval/
+/finetune.jsonl
 
