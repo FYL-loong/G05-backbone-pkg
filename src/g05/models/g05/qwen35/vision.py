@@ -10,6 +10,7 @@ Aligned with g05 interface: provides load_pretrained_weights(hf_config, tensors)
 
 import logging
 import math
+import os
 from typing import Optional
 
 import torch
@@ -22,19 +23,58 @@ from .modules import rotate_half
 _flash_attn_varlen = None
 _flash_attn_backend = None
 
-try:
-    from flash_attn.cute import flash_attn_varlen_func as _fa4_varlen
+# 为什么需要这个开关（真实踩过的坑）：
+#   import 链本来只做 `try: from flash_attn.cute import ... / except ImportError`。
+#   但 flash-attn-4 是 CuTe DSL 实现 —— **import 成功 ≠ 能用**：
+#   forward 时才调 cute.compile() 现场编译 kernel，编译失败会抛
+#       ValueError: Operation creation failed
+#   （实测 flash-attn-4.0.0b15 + nvidia-cutlass-dsl 4.5.2：
+#     flash_fwd.py:392 offset_batch_Q 的 layout 与 view 形状不弱一致）
+#   import 层的兜底抓不到这种"运行期编译失败"，整个训练直接崩。
+#
+#   G05_VISION_ATTN=auto     : 先试 fa4，再 fa2，最后 SDPA（上游行为）
+#   G05_VISION_ATTN=sdpa     : 直接 SDPA，不 import flash-attn（最稳）
+#   G05_VISION_ATTN=fa2      : 强制用 FA2（需已装 flash-attn）
+#   G05_VISION_ATTN=fa4      : 强制用 FA4（需 flash-attn-4 与 cutlass-dsl 版本匹配）
+_vision_attn_pref = os.environ.get("G05_VISION_ATTN", "auto").strip().lower()
 
-    _flash_attn_varlen = _fa4_varlen
-    _flash_attn_backend = "fa4"
-except ImportError:
-    try:
-        from flash_attn import flash_attn_varlen_func as _fa2_varlen
+if _vision_attn_pref == "sdpa":
+    logging.getLogger(__name__).warning(
+        "G05_VISION_ATTN=sdpa —— 视觉注意力强制使用 SDPA（不加载 flash-attn）。"
+        "若 flash-attn 与 cutlass-dsl 版本不匹配会报 "
+        "'ValueError: Operation creation failed'，此时这是正确的选择。"
+    )
+else:
+    _fa4_allowed = _vision_attn_pref in ("auto", "fa4")
+    _fa2_allowed = _vision_attn_pref in ("auto", "fa2")
 
-        _flash_attn_varlen = _fa2_varlen
-        _flash_attn_backend = "fa2"
-    except ImportError:
-        pass
+    if _fa4_allowed:
+        try:
+            from flash_attn.cute import flash_attn_varlen_func as _fa4_varlen
+
+            _flash_attn_varlen = _fa4_varlen
+            _flash_attn_backend = "fa4"
+        except ImportError:
+            pass
+        except Exception as _e:  # noqa: BLE001
+            logging.getLogger(__name__).warning(
+                "flash_attn.cute 导入失败（%s: %s），继续尝试 FA2/SDPA",
+                type(_e).__name__, _e,
+            )
+
+    if _flash_attn_varlen is None and _fa2_allowed:
+        try:
+            from flash_attn import flash_attn_varlen_func as _fa2_varlen
+
+            _flash_attn_varlen = _fa2_varlen
+            _flash_attn_backend = "fa2"
+        except ImportError:
+            pass
+        except Exception as _e:  # noqa: BLE001
+            logging.getLogger(__name__).warning(
+                "flash_attn 导入失败（%s: %s），回退 SDPA",
+                type(_e).__name__, _e,
+            )
 
 _VISION_FLASH_ATTN_WARNED = False
 

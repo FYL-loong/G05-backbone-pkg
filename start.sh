@@ -61,6 +61,19 @@ export TQDM_MINITERS="${TQDM_MINITERS:-50}"
 # 关掉 Python 的 DeprecationWarning / FutureWarning 刷屏
 export PYTHONWARNINGS="${PYTHONWARNINGS:-ignore}"
 
+# ------------------------------------------------- 视觉注意力后端（重要）
+# flash-attn-4 是 CuTe DSL 实现：**import 成功不代表能用** —— forward 时才现场编译
+# kernel，编译失败抛 `ValueError: Operation creation failed`。实测组合：
+#   flash-attn-4.0.0b15（uv.lock 现有）+ nvidia-cutlass-dsl 4.5.2
+#   → flash_fwd.py:392 offset_batch_Q 的 layout 与 view 形状不弱一致，训练直接崩。
+# b15 的依赖声明写的是 `nvidia-cutlass-dsl>=4.4.2`，即**上游声明与实际不兼容**。
+#
+# 默认走 SDPA：不用 flash-attn，视觉注意力用 torch 的
+# F.scaled_dot_product_attention，代码里本来就有这条路径（vision.py 的 else 分支）。
+# 慢一些，但不会因第三方 kernel 编译失败而让整个训练崩掉。
+# 想试 flash-attn（装好匹配版本后）：G05_VISION_ATTN=auto 或 fa4
+export G05_VISION_ATTN="${G05_VISION_ATTN:-sdpa}"
+
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_ROOT"
 

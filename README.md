@@ -124,6 +124,46 @@ WARNING | >> Error loading sample  base_lerobot_dataset.py:904
 
 **若想用 torchcodec**（更快），在镜像里装系统 ffmpeg 即可：`apt-get install -y ffmpeg`。
 
+### ⚠️ 视觉注意力后端：`flash-attn-4` 与 `cutlass-dsl` 版本不匹配
+
+**另一个"import 成功但运行期崩"的坑，与上面视频解码同一模式。**
+
+`vision.py` 的 import 链本来是 `FA4 → FA2 → SDPA`，靠 `except ImportError` 兜底。
+但 `flash-attn-4` 是 **CuTe DSL** 实现 —— **forward 时才调 `cute.compile()` 现场编译 kernel**，
+编译失败抛的异常 import 层抓不到：
+
+```
+vision.py:216  _attend_spatial → flash_attn_varlen_func
+flash_attn/cute/interface.py:981 → cute.compile(...)
+flash_attn/cute/flash_fwd.py:392
+    mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3, ragged=ragged)[None, None, head_idx]
+cutlass/cute/core.py:2673 slice_ → cute_ops_gen.py:3551
+ValueError: Operation creation failed
+```
+
+**根因是版本配对**（`uv.lock` 现有组合）：
+
+| flash-attn-4 版本 | 声明的 cutlass-dsl 要求 | 实际装上 |
+|---|---|---|
+| **4.0.0b15**（uv.lock 里） | `>=4.4.2` | 4.5.2 |
+| 4.0.0b16 | `>=4.5.2` | — |
+| 4.0.0b20 – b25 | `==4.6.0.dev0` | — |
+| **4.0.0b30+** | `>=4.6.2` | — |
+
+即 **b15 声明兼容 `>=4.4.2`，但与 4.5.2 的 CuTe layout API 实际不兼容** —— 上游声明有误。
+
+**本包的修复**（`src/g05/models/g05/qwen35/vision.py`）：加开关 `G05_VISION_ATTN`。
+
+| 取值 | 行为 |
+|---|---|
+| **`sdpa`（本包默认）** | **不加载 flash-attn**，视觉注意力用 `F.scaled_dot_product_attention`（代码本来就有这条路径）。慢一些，但不会崩 |
+| `auto` | 上游行为：FA4 → FA2 → SDPA |
+| `fa4` / `fa2` | 强制指定（需已装匹配版本） |
+
+`start.sh` 默认导出 `G05_VISION_ATTN=sdpa`。**想用 flash-attn 提速**，需要把
+`flash-attn-4` 升到 **`>=4.0.0b30`** 并让 `nvidia-cutlass-dsl>=4.6.2` 一起解析
+（改 `pyproject.toml` 的 pin 后重跑 `uv lock`），再设 `G05_VISION_ATTN=auto`。
+
 ### 日志量控制（平台下载有 100 万行上限）
 
 平台日志下载**上限 100 万行**。实测一次坏掉的运行产生了 **3000 万行**以上，
@@ -232,6 +272,7 @@ MODE=setup bash start.sh
 | `UPLOAD_INTERVAL` | `600` | 守护上传轮询秒数 |
 | `ONLY_TASK` | 空 | 设了就只拉单任务，如 `TASK-YAM-0006` |
 | `G05_VIDEO_BACKEND` | 自动探测 | 视频解码后端：`pyav`（不需系统 ffmpeg）或 `torchcodec`（需系统 ffmpeg） |
+| `G05_VISION_ATTN` | **`sdpa`** | 视觉注意力后端：`sdpa`（稳）/ `auto`（FA4→FA2→SDPA）/ `fa4` / `fa2` |
 | `KEEPALIVE` | `0` | 收尾后挂起 N 秒再退出，便于进容器查看 |
 
 ### 训练跑起来之后
