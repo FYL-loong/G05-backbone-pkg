@@ -72,6 +72,32 @@ export NCCL_DEBUG_SUBSYS="${NCCL_DEBUG_SUBSYS:-INIT,NET}"
 # tqdm 进度条每步刷新会产生大量行；降低刷新频率（只影响观感，不影响训练）
 export TQDM_MININTERVAL="${TQDM_MININTERVAL:-10}"
 export TQDM_MINITERS="${TQDM_MINITERS:-50}"
+# ------------------------------------------------- NCCL：绕开不匹配的 HPC-X 插件
+# ★ 这是 4 卡训练报 "CUDA error: an illegal memory access" 的根因。
+#
+# 证据（train.stdout.log）：
+#   NCCL INFO NET/Plugin: Failed to find ncclNetPlugin_v10 symbol.
+#   NCCL INFO NET/Plugin: Loaded net plugin NCCL RDMA Plugin v9 (v9)      <- 退回 v9
+#   NCCL INFO Plugin Path : /opt/hpcx/nccl_rdma_sharp_plugin/lib/libnccl-net.so
+#   NCCL INFO P2P plugin v9 IBext_v9
+#   NCCL INFO Using network NCCL RDMA Plugin v9
+#
+# 容器自带的 NCCL 是 2.26.2（期望插件实现 v10 接口），而 /opt/hpcx 里的
+# RDMA/SHARP 插件只提供 v9 —— **ABI 不匹配的原生插件被加载并使用**，
+# 在第一次通信（DDP broadcast + P2P 建链）时越界访问设备内存。
+# 这解释了全部现象：
+#   - 1 卡正常 / 4 卡崩       （P2P 插件只在多卡参与时被调用）
+#   - 崩在 DDP broadcast      （第一次真正通信）
+#   - 参数/buffer 全部干净    （与模型无关）
+#
+# 单机多卡【不需要】IB/RDMA：同机通信走 NVLink/P2P + 共享内存更快。
+# 所以直接禁掉插件与 IB。这些都可被外部环境变量覆盖。
+export NCCL_NET_PLUGIN="${NCCL_NET_PLUGIN:-none}"      # 不加载外部 net 插件
+export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"         # 关 IB/RoCE
+export NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-NVL}"         # 同机 P2P 走 NVLink
+export NCCL_SHARP_DISABLE="${NCCL_SHARP_DISABLE:-1}"   # 关 SHARP（collnet 插件）
+export NCCL_COLLNET_ENABLE="${NCCL_COLLNET_ENABLE:-0}"  # 关 collnet
+
 # 关掉 Python 的 DeprecationWarning / FutureWarning 刷屏
 export PYTHONWARNINGS="${PYTHONWARNINGS:-ignore}"
 
