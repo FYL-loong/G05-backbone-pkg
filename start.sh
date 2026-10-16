@@ -704,23 +704,42 @@ try:
     import torch
     print(f"    venv torch={torch.__version__} cuda={torch.version.cuda} "
           f"nccl={torch.cuda.nccl.version()}")
-    print(f"    venv arch_list={torch.cuda.get_arch_list()}")
+    arch = torch.cuda.get_arch_list()
+    print(f"    venv arch_list={arch}")
+    print(f"    venv arch_list 含 sm_120 ? {'sm_120' in arch}")
 except Exception as e:
     print(f"    venv torch 读取失败: {type(e).__name__}: {e}")
+
+# ★ 关键：libnccl.so 到底来自【torch 自带】还是【nvidia-nccl-cu12 pip 包】？
+#   决定修法：前者 -> 必须换 torch/镜像；后者 -> 只升级 pip 包即可（不动 torch）。
 try:
     import torch as _t
-    roots = [os.path.dirname(os.path.dirname(_t.__file__))]
+    torch_dir = os.path.dirname(_t.__file__)
+    site_dirs = []
     try:
-        roots += list(site.getsitepackages())
+        site_dirs = list(site.getsitepackages())
     except Exception:
         pass
-    found = []
-    for r in dict.fromkeys(roots):
-        found += glob.glob(os.path.join(r, "**", "libnccl.so*"), recursive=True)
-    for f in found[:4]:
-        print(f"    venv libnccl: {f}")
-    if not found:
-        print("    venv libnccl: 未找到（可能静态链接进 torch）")
+    # 1) torch 自带（torch/lib/）
+    d1 = glob.glob(os.path.join(torch_dir, "lib", "libnccl.so*"))
+    print(f"    [A] torch 自带 torch/lib/libnccl.so*: {d1 or '无'}")
+    # 2) pip 包 nvidia/nccl/lib/
+    d2 = []
+    for r in [os.path.dirname(torch_dir)] + site_dirs:
+        d2 += glob.glob(os.path.join(r, "nvidia", "nccl", "lib", "libnccl.so*"))
+        d2 += glob.glob(os.path.join(r, "**", "nvidia", "nccl", "**", "libnccl.so*"),
+                        recursive=True)
+    d2 = sorted(dict.fromkeys(d2))
+    print(f"    [B] pip 包 nvidia/nccl/lib/libnccl.so*: {d2 or '无'}")
+    # 3) 版本目录名（pip 包路径里带版本号）
+    for f in d2[:3]:
+        print(f"        版本线索: {f}")
+    if not d1 and not d2:
+        print("    -> 两者都没找到：NCCL 可能静态链接进 torch（升 pip 包无效）")
+    elif d2 and not d1:
+        print("    -> ★ 用 pip 包：可通过升级 nvidia-nccl-cu12 修，不必换 torch")
+    elif d1:
+        print("    -> ★ 用 torch 自带：升 pip 包无效，必须换 torch/镜像")
 except Exception as e:
     print(f"    venv libnccl 查找失败: {e}")
 PYV
