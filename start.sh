@@ -2,9 +2,13 @@
 # ============================================================================
 # start.sh — G0.5 backbone 微调一键启动（百度百舸 AIHC，无人值守）
 #
-# 职责只有一件：把微调跑起来、跑完、把权重存到 HF。
-#   - 日志：平台自带下载功能，本脚本不再自己收集/上传日志。
+# 职责：把微调跑起来 → 跑完 → 把【权重和训练日志】存到 HF。
 #   - 权重：容器临时，必须上传 HF，否则训练白跑。
+#   - 日志：⚠️ 必须上传。训练 stdout 被重定向到 /workspace/train.stdout.log 这个
+#     【文件】，而平台日志采的是容器 stdout —— **采不到重定向进文件的内容**。
+#     实测踩过：训练跑 5 分钟就退出、什么都没保存，因为没传这个文件，
+#     崩溃现场随容器销毁永久丢失，只能靠猜。现在退出码 + 日志都会传到 HF。
+#     （平台自带日志下载对【平台 stdout】有效，对重定向文件无效 —— 两者互补。）
 #
 # 平台「执行命令」框 —— 复制这段，只改 HF_TOKEN：
 #
@@ -393,24 +397,39 @@ do_train() {
 
 ============================================================
  训练在后台跑。start.sh 会【阻塞等待训练结束】，然后自动上传权重。
- 日志：平台自带下载功能可直接取；也可 tail -f /workspace/train.stdout.log
+ 日志：训练 stdout 会被上传到 HF（容器销毁后仍可诊断）
  exp 目录：${exp:-<未识别>}
 ============================================================
 EOF
 
     # ------------------------------------------------------------ 等待训练结束
+    # ⚠️ 用 `wait` 而不是轮询 `kill -0`：轮询只能知道"进程没了"，【拿不到退出码】，
+    #    所以无法区分"训练正常结束"和"训练崩溃后静默退出"。实测踩过：训练只跑 5
+    #    分钟就退出、什么都没保存，而我们看不到退出码，只能猜。
+    #    wait 还会在信号中断时返回 >128（如 137=OOM kill），这是关键线索。
     step "等待训练结束（PID=$pid）"
-    local waited=0
-    while kill -0 "$pid" 2>/dev/null; do
-        sleep 60
-        waited=$((waited+60))
-        if (( waited % 600 == 0 )); then
-            local last_step
-            last_step="$(grep -aoE '"step":[[:space:]]*[0-9]+' /workspace/train.stdout.log 2>/dev/null | tail -1 || true)"
-            info "已等待 $((waited/60)) 分钟，日志最后 step: ${last_step:-未知}"
-        fi
-    done
-    ok "训练进程已退出（累计等待 $((waited/60)) 分钟）"
+    local rc=0
+    set +e
+    wait "$pid"
+    rc=$?
+    set -e
+    echo "$rc" > /workspace/train.exit_code
+    if [[ $rc -eq 0 ]]; then
+        ok "训练进程正常结束（退出码 0）"
+    else
+        warn "训练进程【异常退出】退出码=$rc（已写入 /workspace/train.exit_code）"
+        case "$rc" in
+            137) warn "  137 = 128+9(SIGKILL) —— 常见于【被 OOM killer 杀掉】或平台强杀" ;;
+            143) warn "  143 = 128+15(SIGTERM) —— 被要求终止（平台/超时）" ;;
+            134) warn "  134 = 128+6(SIGABRT) —— C++ 层 abort（CUDA/NCCL 常见）" ;;
+            139) warn "  139 = 128+11(SIGSEGV) —— 段错误" ;;
+            *)   warn "  非零退出码，见训练 stdout 日志尾部" ;;
+        esac
+    fi
+
+    # 训练日志尾部立刻打到平台日志里（万一上传失败，平台日志至少留一份）
+    info "训练 stdout 尾部 120 行（完整日志会随收尾上传到 HF）："
+    tail -n 120 /workspace/train.stdout.log 2>/dev/null || true
 
     # 等最终 checkpoint 落盘（finetune.py 保存后进程才退出，IO 可能仍在 flush）
     info "等 120s 让最终 checkpoint 落盘..."
