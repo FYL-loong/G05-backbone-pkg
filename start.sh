@@ -599,9 +599,57 @@ PY
 EOF
 }
 
+# ============================================================================
+# smoke-ddp：多卡 DDP/NCCL 自检（极小模型，约 1-2 分钟）
+#   用途：区分"4 卡通信环境本身有问题"还是"模型某处让 NCCL 越界"。
+#   实测正式训练在 DDP 构造期间报 illegal memory access，1 卡却正常。
+# ============================================================================
+do_smoke_ddp() {
+    activate_venv
+    local n="${GPUS:-${NPROC_PER_NODE:-${MLP_WORKER_GPU:-${MLP_WORKER_NUM:-$(nvidia-smi -L 2>/dev/null | wc -l | tr -d ' ')}}}}"
+    [[ "${n:-0}" -ge 1 ]] || n=1
+    info "多卡自检，GPU 数=$n"
+
+    if [[ ! -f tools/ddp_smoke_test.py ]]; then
+        fail "缺少 tools/ddp_smoke_test.py"
+    fi
+
+    step "多卡 DDP/NCCL 自检（极小模型，不加载权重/数据）"
+    # ⚠️ 参数与 scripts/run/finetune.sh:321-325 的官方单机路径【完全一致】，
+    #    这样自检结果才能代表正式训练的启动方式。
+    #    也用它自带的 `torchrun` 可执行文件，避免和官方走的模块不是同一个。
+    set +e
+    python -m torch.distributed.run \
+        --standalone --nnodes 1 --nproc-per-node "$n" \
+        tools/ddp_smoke_test.py
+    local rc=$?
+    set -e
+    echo
+    if [[ $rc -eq 0 ]]; then
+        ok "多卡自检【全部通过】—— 4 卡 DDP/NCCL 环境正常"
+        cat <<'EOF'
+ 结论：环境没问题。正式训练崩溃的原因在【模型】侧 ——
+       某个张量让 NCCL 越界（需要继续查模型）。
+EOF
+    else
+        warn "多卡自检【有失败项】rc=$rc —— 很可能是环境问题，与模型无关"
+        cat <<'EOF'
+ 结论：4 卡通信本身就有问题。请按失败的那一项尝试：
+
+   NCCL_IB_DISABLE=1        关掉 InfiniBand/RoCE（容器里常没 IB）
+   NCCL_P2P_DISABLE=1       关掉 GPU 间 P2P（绕过 P2P/DMA-BUF 问题）
+   NCCL_NET_GDR_LEVEL=0     关掉 GPUDirect RDMA
+   NCCL_DEBUG=INFO          打开 NCCL 详细日志定位
+
+ 用法：在平台执行命令里 export 上述变量后再跑 MODE=smoke-ddp
+EOF
+    fi
+}
+
 # ---------------------------------------------------------------- 分发
 case "$MODE" in
-    smoke)  do_smoke ;;
+    smoke)     do_smoke ;;
+    smoke-ddp) do_smoke_ddp ;;
     setup)  do_setup ;;
     verify) do_verify ;;
     train)  do_train ;;
@@ -610,7 +658,7 @@ case "$MODE" in
         do_verify          # L3 不通过会在这里非零退出，不会带着坏权重去训练
         do_train
         ;;
-    *)      fail "未知 MODE=$MODE（可选 setup | verify | train | all）" ;;
+    *)      fail "未知 MODE=$MODE（可选 smoke | smoke-ddp | setup | verify | train | all）" ;;
 esac
 
 step "MODE=$MODE 结束"
