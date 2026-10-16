@@ -463,7 +463,14 @@ do_train() {
     info "注意：batch_size 是每卡的，全局 batch = batch_size × $n"
 
     step "启动正式训练（后台 -> /workspace/train.stdout.log）"
-    nohup bash scripts/run/finetune.sh "$n" yam logger.mode=offline \
+    # ★ 透传 start.sh 收到的额外参数给 finetune.sh（它会把非 -- 开头的当作
+    #   hydra 覆盖，例如 model.max_epochs=1）。
+    #   ⚠️ 之前这里没透传，导致 `bash start.sh model.max_epochs=1` 静默失效 ——
+    #      用户以为只跑 1 epoch，实际跑了 10 个 epoch（约 11 天）。
+    if [[ $# -gt 0 ]]; then
+        info "透传 hydra 覆盖给 finetune.sh：$*"
+    fi
+    nohup bash scripts/run/finetune.sh "$n" yam logger.mode=offline "$@" \
         > /workspace/train.stdout.log 2>&1 &
     local pid=$!
     echo "$pid" > /workspace/train.pid
@@ -1003,16 +1010,18 @@ EOF
 }
 
 # ---------------------------------------------------------------- 分发
+# ⚠️ 必须把 start.sh 收到的额外参数透传给 do_train，否则
+#    `bash start.sh model.max_epochs=1` 会静默失效（用户以为 1 epoch，实际 10 epoch）。
 case "$MODE" in
     smoke)     do_smoke ;;
     smoke-ddp) do_smoke_ddp ;;
     setup)  do_setup ;;
     verify) do_verify ;;
-    train)  do_train ;;
+    train)  do_train "$@" ;;
     all)
         do_setup
         do_verify          # L3 不通过会在这里非零退出，不会带着坏权重去训练
-        do_train
+        do_train "$@"
         ;;
     *)      fail "未知 MODE=$MODE（可选 smoke | smoke-ddp | setup | verify | train | all）" ;;
 esac
