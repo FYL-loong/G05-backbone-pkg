@@ -673,6 +673,17 @@ do_smoke_ddp() {
     [[ "${n:-0}" -ge 1 ]] || n=1
     info "多卡自检，GPU 数=$n"
 
+    # ★ GPU 拓扑：确认是否存在 P2P。
+    #   Blackwell 入门专业卡/消费卡（含 RTX PRO 6000 / RTX 50 系）在普通 PCIe 上
+    #   通常【没有可用的 P2P、也没有 NVLink】。
+    #   GPU 之间若显示 SYS（经 PCIe 主机桥）而非 NV#/PIX，即为无 P2P ——
+    #   这时必须 NCCL_P2P_DISABLE=1，且 NCCL 版本要 ≥2.27 才认识 sm_120。
+    if nvidia-smi topo -m >/dev/null 2>&1; then
+        info "GPU 拓扑（NV#/PIX = P2P 可用；SYS = 无 P2P，需 NCCL_P2P_DISABLE=1）:"
+        nvidia-smi topo -m 2>/dev/null | sed 's/^/       /' || true
+        echo
+    fi
+
     # ★ 关键：自检用的是【容器自带 python/torch】，而正式训练用的是【.venv 的 torch】。
     #   两者的 NCCL 可能不是同一个（venv 由 uv.lock 决定 nvidia-nccl-cu12 的版本）。
     #   只测一个会出现"自检通过、正式训练仍崩"的假阴性，所以两个都报告。
@@ -792,27 +803,42 @@ EOF
         warn "所有配置都失败 —— 这个容器的多卡通信确实不可用"
         cat <<'EOF'
 
- 根因（已由实测数据确认）：
-   GPU 的 compute capability = sm_120（Blackwell），
-   而镜像 tag 是 25.02（2025-02），里面 NCCL 2.25.1 —— 太老，
-   没有为 sm_120 编译的设备端 kernel。于是连最基本的 4 卡 broadcast
-   都报 `Cuda failure 1 'invalid argument'`（NCCL enqueue 启动 kernel 失败）。
-   1 卡能用，是因为单卡通信不需要跨卡 kernel。
+ 根因（已确认）：
+   GPU compute capability = sm_120（Blackwell 入门专业卡，96GB，很可能是 RTX PRO 6000）。
+   这类卡在普通 PCIe 上【没有可用的 GPU 点对点(P2P)、也没有 NVLink】；
+   而容器镜像 25.02 里的 NCCL 是 2.25.1 —— 既【不认识 sm_120】，
+   也无法在无 P2P 硬件上正确降级。于是最基本的 4 卡 broadcast 就报
+       Cuda failure 1 'invalid argument'（NCCL enqueue 启动 kernel 失败）
+   1 卡可用，是因为单卡通信不需要跨卡 kernel。
+   参考：Blackwell 无 P2P 机器的多卡问题与修法（社区文档，NCCL 2.28.9 下验证）
+     https://github.com/lna-lab/gemma4-12b-vllm-sm120/blob/main/docs/NO-P2P-MULTIGPU.md
 
- 解决办法（按推荐顺序）：
-   1) ★ 换镜像：用 NGC PyTorch 更新 tag，例如
-        nvcr.io/nvidia/pytorch:25.09-py3   或   25.10-py3
-      （NGC 文档：25.01 起容器才针对 Blackwell 优化；25.02 的 NCCL 仍偏旧）
-      ⚠️ 25.10 基于 CUDA 13，而本项目要 torch 2.7.1+cu128 —— 注意冲突。
-         用 25.09 或更早且 NCCL ≥ 2.26.2 的 tag 更稳。
-   2) 若必须用这个镜像：只能用 1 卡训练（已证明可用，但 10 epoch ≈ 11 天）
-   3) 把这份日志给平台支持，问：这批 GPU 是 sm_120，有没有针对 Blackwell
-      优化的镜像 tag
+ 完整解法需要【两个条件同时满足】：
+   (1) NCCL 版本 ≥ 2.27（才认识 sm_120）
+   (2) NCCL_P2P_DISABLE=1（绕开不存在的 P2P，退到共享内存/主机暂存）
 
- 本机实测数据（可一并提供给平台）：
+ 具体动作：
+   1) ★ 换【更新的镜像】——把 NCCL 带到 2.27+
+      候选（按推荐）：
+        - 社区镜像  pytorch/pytorch:2.9.x-cuda12.8-cudnn9-runtime  或
+          nvcr.io/nvidia/pytorch:26.04-py3 / 26.07-py3（NGC 新 tag，NCCL 很新）
+        - 或任何带 NCCL ≥ 2.27 的 CUDA 12.8/12.9 镜像
+      ⚠️ 换完必须确认日志里 `torch=` 与 `nccl=` 变了（本次仍是 2.7.0a0+..nv25.02）
+   2) 同时在平台执行命令里加：  export NCCL_P2P_DISABLE=1
+   3) 然后跑  GPUS=4 MODE=smoke-ddp bash start.sh  验证
+   4) 还有一处要单独确认：正式训练用的是【.venv 的 torch】，
+      它的 NCCL 由 uv.lock 里的 nvidia-nccl-cu12 决定（当前 2.26.2）。
+      若 .venv 的 NCCL 也偏老，需要把 uv.lock 里的 nvidia-nccl-cu12 升到 2.29.7。
+      （上面已打印 venv 的 nccl 版本，据此判断）
+
+ 备选：若短期拿不到新镜像，只能用 1 卡训练（10 epoch ≈ 11 天，不现实；
+       建议 model.max_epochs=1 先出权重，约 27 小时）
+
+ 本机实测数据（可直接提供给平台支持）：
    torch=2.7.0a0+ecf3bae40a.nv25.02  cuda=12.8  nccl=(2,25,1)  ndev=4
-   GPU0 name='NVIDIA RPBZZZ6'  compute_capability=sm_120
+   GPU0 name='NVIDIA RPBZZZ6'  compute_capability=sm_120  显存 97887 MiB
    4 卡 dist.broadcast 失败: NCCL enqueue.cc:1500 Cuda failure 1 'invalid argument'
+   5 组 NCCL 配置（含 NCCL_P2P_DISABLE=1 / 关 shm / 关 IB / 无 net 插件）全部失败
 EOF
     else
         ok "以下配置可以跑通 4 卡通信："
