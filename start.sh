@@ -680,7 +680,6 @@ do_smoke_ddp() {
     step "多卡 DDP/NCCL 自检（极小模型，不加载权重/数据）"
     # ⚠️ 参数与 scripts/run/finetune.sh:321-325 的官方单机路径【完全一致】，
     #    这样自检结果才能代表正式训练的启动方式。
-    #    也用它自带的 `torchrun` 可执行文件，避免和官方走的模块不是同一个。
     set +e
     "$PY" -m torch.distributed.run \
         --standalone --nnodes 1 --nproc-per-node "$n" \
@@ -691,22 +690,91 @@ do_smoke_ddp() {
     if [[ $rc -eq 0 ]]; then
         ok "多卡自检【全部通过】—— 4 卡 DDP/NCCL 环境正常"
         cat <<'EOF'
- 结论：环境没问题。正式训练崩溃的原因在【模型】侧 ——
-       某个张量让 NCCL 越界（需要继续查模型）。
+ 结论：环境没问题。正式训练崩溃的原因在【模型】侧。
+EOF
+        return 0
+    fi
+
+    # ---- 失败：自动尝试一组 NCCL 配置，找出哪种能跑通 --------------------
+    # 实测第 1 步 dist.broadcast 就报 "Cuda failure 1 'invalid argument'"
+    # （用镜像自带 torch、极小模型、无数据集），说明【多卡通信机制】不被支持。
+    # 与其一轮一轮排队试，不如一次把候选配置全试一遍。
+    warn "多卡自检失败 rc=$rc —— 自动尝试以下 NCCL 配置（每个约 20 秒）"
+    cat <<'EOF'
+
+ 候选配置说明：
+   A 保持现状                    —— 基线
+   B NCCL_P2P_DISABLE=1          —— 关 GPU 间 P2P（最可能有效：单卡不用 P2P 所以正常）
+   C NCCL_P2P_DISABLE=1 + IB 关  —— 退到共享内存/套接字
+   D NCCL_P2P_LEVEL=LOC          —— 只用同 PCIe 交换机内的 P2P
+   E NCCL_NET_PLUGIN=none        —— 不加载外部网络插件
+EOF
+    local cfg_names=(
+        "A_基线"
+        "B_关P2P"
+        "C_关P2P+关IB"
+        "D_P2P_LEVEL_LOC"
+        "E_无net插件"
+    )
+    local cfg_envs=(
+        ""
+        "NCCL_P2P_DISABLE=1"
+        "NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1"
+        "NCCL_P2P_LEVEL=LOC"
+        "NCCL_NET_PLUGIN=none"
+    )
+    local worked=()
+    local idx
+    for idx in "${!cfg_names[@]}"; do
+        local nm="${cfg_names[$idx]}"
+        local ev="${cfg_envs[$idx]}"
+        echo
+        info "---- 尝试 [$nm]  env: ${ev:-<无追加>} ----"
+        set +e
+        # shellcheck disable=SC2086
+        env $ev "$PY" -m torch.distributed.run \
+            --standalone --nnodes 1 --nproc-per-node "$n" \
+            tools/nccl_minimal_test.py 2>&1 | \
+            grep -E 'nccl-min|Cuda failure|Unhandled|ncclUnhandled' | head -20
+        local rc2=${PIPESTATUS[0]}
+        set -e
+        if [[ $rc2 -eq 0 ]]; then
+            ok "[$nm] ✅ 通过"
+            worked+=("$nm => $ev")
+        else
+            warn "[$nm] ❌ 失败 rc=$rc2"
+        fi
+    done
+
+    echo
+    step "NCCL 配置尝试结论"
+    if [[ ${#worked[@]} -eq 0 ]]; then
+        warn "所有配置都失败 —— 这个容器的多卡通信确实不可用"
+        cat <<'EOF'
+
+ 建议（按优先级）：
+   1) 换镜像：当前是 2.7.0a0+ecf3bae40a.nv25.02。改用平台【官方推荐】的
+      PyTorch 镜像，或与 GPU 架构匹配的 CUDA 版本
+   2) 查 GPU 真实型号：nvidia-smi 显示 "NVIDIA RPBZZZ6" 是【平台脱敏名】。
+      若型号较特殊，通用镜像里的 NCCL/PyTorch 可能没有该架构的 kernel ——
+      "Cuda failure 1 'invalid argument'" 正是这种典型症状
+   3) 暂时用 1 卡：1 卡已证明完全可用（L4 过拟合 500 步通过），
+      只是慢；先跑出可用权重，再解决多卡
 EOF
     else
-        warn "多卡自检【有失败项】rc=$rc —— 很可能是环境问题，与模型无关"
+        ok "以下配置可以跑通 4 卡通信："
+        local w
+        for w in "${worked[@]}"; do
+            echo "     $w"
+        done
         cat <<'EOF'
- 结论：4 卡通信本身就有问题。请按失败的那一项尝试：
 
-   NCCL_IB_DISABLE=1        关掉 InfiniBand/RoCE（容器里常没 IB）
-   NCCL_P2P_DISABLE=1       关掉 GPU 间 P2P（绕过 P2P/DMA-BUF 问题）
-   NCCL_NET_GDR_LEVEL=0     关掉 GPUDirect RDMA
-   NCCL_DEBUG=INFO          打开 NCCL 详细日志定位
-
- 用法：在平台执行命令里 export 上述变量后再跑 MODE=smoke-ddp
+ 用法：把生效的那组变量加到平台执行命令里，例如：
+     export NCCL_P2P_DISABLE=1
+   （start.sh 也支持外部覆盖这些变量；下一轮我会把它们设为默认。）
 EOF
     fi
+    return 0
 }
 
 # ---------------------------------------------------------------- 分发
