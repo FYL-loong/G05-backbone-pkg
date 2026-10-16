@@ -199,50 +199,46 @@ if [[ "${G05_NCCL_UPGRADE:-1}" == "1" ]]; then
         warn "全部方式都失败 —— NCCL 仍是旧版，4 卡会失败。完整日志：$NCCL_LOG"
     fi
 
-    # ★ 强制验证：不看安装日志，只看【torch 实际加载的是哪个版本】。
-    #   这一条是唯一可信的判据。
-    #   ⚠️ 实测踩过：uv pip 报"装好了 2.29.7"，但 torch 仍加载 2.26.2 ——
-    #      说明磁盘上还有另一份 libnccl.so.2 被优先加载（多半在 LD_LIBRARY_PATH 里）。
-    #      所以这里除了看版本，还要把【所有 libnccl.so.2 及加载顺序】打出来。
-    info "验证 torch 实际加载的 NCCL："
+    # ★ 验证装了哪个版本，以及磁盘上有哪几份 libnccl.so.2。
+    #   ⚠️ 判据必须是 ldd（下面那段），不能用 torch.cuda.nccl.version() ——
+    #      后者是 torch 编译期常量，与运行时实际加载的库无关。
+    info "查看已安装的 NCCL 与磁盘上所有 libnccl.so.2："
     "$VENV_PY_PRE" "$PROJECT_ROOT/tools/which_nccl.py" 2>&1 | sed 's/^/  /' || true
 
-    # 结论行：把 torch 报的版本独立再确认一次（which_nccl.py 输出可能很长）
-    "$VENV_PY_PRE" - "$NCCL_VER" <<'PYNCCL' || true
-import sys
-want_str = sys.argv[1] if len(sys.argv) > 1 else "?"
+    # 硬判定：用 ldd 看 torch 实际链接到哪份 libnccl.so.2。
+    # ⚠️ 不要用 torch.cuda.nccl.version() 判定 —— 它是 torch 编译期常量，
+    #    与运行时实际加载的库无关（实测：升级后它仍报旧版，而 ldd 已指向新版）。
+    info "判定 torch 实际链接的 NCCL（用 ldd，不用 nccl.version()）："
+    "$VENV_PY_PRE" - <<'PYLDD' || true
+import os, re, shutil, subprocess
 try:
     import torch
-    got = tuple(torch.cuda.nccl.version())
-    want = tuple(int(x) for x in want_str.split("."))
-    if got >= want:
-        print(f"[nccl] ✅ 升级【生效】：torch 加载 {got}（目标 {want_str}）")
+    lib = os.path.join(os.path.dirname(torch.__file__), "lib", "libtorch_cuda.so")
+    if not os.path.exists(lib):
+        print("[ldd] 找不到 libtorch_cuda.so")
+    elif not shutil.which("ldd"):
+        print("[ldd] 环境里没有 ldd 命令")
     else:
-        print(f"[nccl] ❌ 升级【未生效】：torch 仍加载 {got}（目标 {want_str}）")
-        print("[nccl]    看上面 which_nccl.py 的清单 —— 多半有另一份 libnccl.so.2")
-        print("[nccl]    排在前面（LD_LIBRARY_PATH 里的容器自带版本）。")
+        out = subprocess.run(["ldd", lib], capture_output=True, text=True).stdout or ""
+        hits = [ln.strip() for ln in out.splitlines() if "nccl" in ln.lower()]
+        for h in hits:
+            print("[ldd] " + h)
+        if not hits:
+            print("[ldd] libtorch_cuda.so 没有 nccl 条目")
+        else:
+            tgt = hits[0].split("=>")[-1].strip().split(" ")[0]
+            if "nvidia/nccl" in tgt and ".venv" in tgt:
+                print(f"[ldd] ✅ 链接到 venv 的 NCCL：{tgt}")
+            else:
+                print(f"[ldd] ⚠️ 链接到其他位置：{tgt}")
+    try:
+        print(f"[ldd] （参考，不可作为判据）torch 编译期常量 nccl="
+              f"{torch.cuda.nccl.version()}")
+    except Exception as e:
+        print(f"[ldd] （参考）读编译期常量失败: {type(e).__name__}")
 except Exception as e:
-    print(f"[nccl] 读 torch 失败: {type(e).__name__}: {e}")
-PYNCCL
-    # 硬判定：NCCL < 2.27 时 sm_120 多卡必失败，明确劝阻跑正式任务
-    if ! "$VENV_PY_PRE" -c "
-import sys, torch
-got = tuple(torch.cuda.nccl.version())
-print(f'[nccl] 判定: nccl={got}  sm_120 需要 >=2.27  ->  ' + ('通过 ✅' if got >= (2,27) else '不通过 ❌'))
-sys.exit(0 if got >= (2,27) else 3)
-" ; then
-        warn "torch 实际加载的 NCCL < 2.27 —— 4 卡训练会失败，【不要跑正式任务】"
-        cat <<'EOFNCCL'
-  下一步（按上面 which_nccl.py 的清单选）：
-   · 若清单里【有】多份 libnccl.so.2，且排在前面的是容器自带的旧版：
-        → 是 LD_LIBRARY_PATH 优先级问题。把 venv 的 nvidia/nccl/lib 提前：
-            export LD_LIBRARY_PATH="$PWD/.venv/lib/python3.10/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH"
-          或者直接把新版 .so 覆盖到那个旧版本所在目录。
-   · 若清单里【只有】venv 一份、且确实是 2.29.7，但 torch 仍报旧版：
-        → torch 是静态链接/内置 NCCL，只能换 torch 或换镜像。
-   · 兜底：GPUS=1 bash start.sh model.max_epochs=1   （1 卡约 27 小时，先出权重）
-EOFNCCL
-    fi
+    print(f"[ldd] 失败: {type(e).__name__}: {e}")
+PYLDD
 else
     info "G05_NCCL_UPGRADE=0 —— 不改 NCCL（sm_120 上 4 卡会失败）"
 fi

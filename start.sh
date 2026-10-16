@@ -182,17 +182,24 @@ prefer_venv_nccl() {
         *":$d:"*) : ;;                                  # 已在最前，幂等
         *) export LD_LIBRARY_PATH="$d:${LD_LIBRARY_PATH:-}" ;;
     esac
-    # 确认生效：torch 实际报出来的 NCCL 版本
-    local v
-    v="$(python -c 'import torch;print(".".join(map(str,torch.cuda.nccl.version())))' 2>/dev/null || echo '?')"
-    if [[ "$v" == "?" ]]; then
-        warn "读不到 torch 的 NCCL 版本"
-    elif [[ "$(printf '%s\n' "2.27" "$v" | sort -V | head -1)" == "2.27" ]]; then
-        ok "torch 实际加载的 NCCL = $v（>=2.27，支持 sm_120）来自 $d"
+    # 确认生效：用 ldd 看 torch 的 C 扩展【实际链接】到哪份 libnccl.so.2。
+    # ⚠️ 不要用 torch.cuda.nccl.version() —— 它返回 torch【编译期】写入的常量，
+    #    与运行时实际加载的库无关，永远报同一个数字（实测踩坑：z 升级后它仍报
+    #    2.26.2，而 ldd 显示已指向 venv 的新版）。用它做判据会得出错误结论。
+    local got_ldd
+    got_ldd="$(ldd "$(python -c 'import torch,os;print(os.path.join(os.path.dirname(torch.__file__),"lib","libtorch_cuda.so"))' 2>/dev/null)" 2>/dev/null \
+        | awk '/libnccl/{print $3; exit}')"
+    if [[ -n "$got_ldd" ]]; then
+        if [[ "$got_ldd" == *"$d"* || "$got_ldd" == *"nvidia/nccl"* ]]; then
+            ok "torch 实际链接的 NCCL = $got_ldd（venv 的 nvidia/nccl 版本）"
+        else
+            warn "torch 实际链接的 NCCL = $got_ldd（不是 venv 的那份）"
+        fi
     else
-        warn "torch 实际加载的 NCCL = $v（<2.27，sm_120 上多卡会失败）"
-        warn "  已把 $d 前置到 LD_LIBRARY_PATH，但仍加载了旧版 —— 请跑 tools/which_nccl.py 看清单"
+        warn "ldd 读不到 libnccl 链接目标（继续，不影响后续）"
     fi
+    # 附带报告一下 torch 编译期常量（仅供参考，不作为判据）
+    info "（参考）torch 编译期记录的 NCCL 常量 = $(python -c 'import torch;print(".".join(map(str,torch.cuda.nccl.version())))' 2>/dev/null || echo '?')"
 }
 
 # 带重试执行。无人值守时网络抖动不该让整个任务失败。
@@ -874,37 +881,44 @@ EOF
 
  候选配置（按成功率排序）：
    A 基线                             —— 保留平台注入的一切
-   B 清掉平台注入的 RDMA 变量          —— 容器设备若与宿主机注入的值对不上时有效
-   C P2P 关闭 + 清 RDMA 变量           —— 无 NVLink 的卡
-   D 纯套接字                          —— 完全不用设备端 kernel
-   E 只改 GID 索引为 0                 —— ★ 实测平台注入 NCCL_IB_GID_INDEX=7，
-                                        而 RoCE 网卡通常只有 GID 0..5；索引无效
-                                        会让 IB 传输初始化失败
-   F GID 索引 3 + 关 P2P               —— 同上，换一个常见有效值
-   G 关 P2P + 纯套接字 + GID 0         —— 组合
+   B 清掉平台注入的 RDMA 变量
+   C P2P 关闭 + 清 RDMA 变量
+   D 纯套接字
+   E ★ 清掉【全部】平台注入的 NCCL 变量 —— 平台是按 A100/H800（有 NVLink+RoCE）
+     注入的：NCCL_P2P_LEVEL=NVL / NCCL_MIN_NCHANNELS=8 / NCCL_VERSION=2.25.1
+     / NCCL_IB_TC=162 / NCCL_IB_HCA==mlx5_2（值带多余 '='）等。本机【无 NVLink】，
+     这些预设可能直接冲突，所以整组清掉再试。
+   F 清全部 + 关 P2P + 关 IB
+   G 只清 P2P_LEVEL 和 NCHANNELS —— 精准定位是否这两个在捣乱
 EOF
     local cfg_names=(
         "A_基线"
         "B_清RDMA变量"
         "C_关P2P+清RDMA"
         "D_纯套接字"
-        "E_GID索引0"
-        "F_GID索引尝试全部"
-        "G_关P2P+纯套接字"
+        "E_清全部平台NCCL"
+        "F_清平台+关P2P+关IB"
+        "G_只清P2P_LEVEL和NCHANNELS"
     )
-    # 清掉环境变量的写法：用 env -u 逐个 unset
+    # 平壊/BCC 的百舸会按【宿主机拓扑】注入一整套 NCCL 变量。实测注入里有：
+    #   NCCL_VERSION=2.25.1, NCCL_P2P_LEVEL=NVL, NCCL_MIN_NCHANNELS=8,
+    #   NCCL_IB_TC=162, NCCL_IB_TIMEOUT=22, NCCL_IB_QPS_PER_CONNECTION=8,
+    #   NCCL_IB_HCA==mlx5_2, NCCL_SOCKET_IFNAME==eth0, ...
+    # 这些是给 A100/H800（有 NVLink + RoCE）准备的；本机【无 NVLink】，且部分
+    # 值带多余的 '='（疑似注入 bug）。所以专门试“全部清掉”。
+    local CLEAR_ALL_NCCL="env -u NCCL_VERSION -u NCCL_P2P_LEVEL -u NCCL_MIN_NCHANNELS \
+-u NCCL_IB_HCA -u NCCL_IB_GID_INDEX -u NCCL_IB_ADAPTIVE_ROUTING -u NCCL_IB_TC \
+-u NCCL_IB_TIMEOUT -u NCCL_IB_QPS_PER_CONNECTION -u NCCL_TOPO_FILE \
+-u NCCL_SOCKET_IFNAME -u NCCL_SHARP_DISABLE -u NCCL_COLLNET_ENABLE"
     local CLEAR_RDMA="env -u NCCL_IB_HCA -u NCCL_IB_GID_INDEX -u NCCL_IB_ADAPTIVE_ROUTING -u NCCL_TOPO_FILE"
-    # ★ 实测平台注入 NCCL_IB_GID_INDEX=7，而 RoCE 网卡通常只有 GID 0..5 ——
-    #   指到不存在的索引会让 IB 传输初始化失败。所以专门试几个有效索引，
-    #   以及"关掉 GID 索引强制探测"。
     local cfg_cmds=(
         "env"
         "$CLEAR_RDMA"
         "$CLEAR_RDMA NCCL_P2P_DISABLE=1"
         "env NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 NCCL_SHM_DISABLE=1"
-        "env NCCL_IB_GID_INDEX=0"
-        "env NCCL_IB_GID_INDEX=3 NCCL_P2P_DISABLE=1"
-        "env NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 NCCL_SHM_DISABLE=1 NCCL_IB_GID_INDEX=0"
+        "$CLEAR_ALL_NCCL"
+        "$CLEAR_ALL_NCCL NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1"
+        "env -u NCCL_P2P_LEVEL -u NCCL_MIN_NCHANNELS"
     )
     local worked=()
     local idx
