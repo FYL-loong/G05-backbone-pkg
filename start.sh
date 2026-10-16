@@ -702,6 +702,20 @@ do_smoke_ddp() {
     (ip -o -4 addr show 2>/dev/null || ifconfig -a 2>/dev/null) | sed 's/^/       /' || true
     echo "       --- /dev/infiniband（RDMA 字符设备）---"
     ls -1 /dev/infiniband 2>/dev/null | sed 's/^/       /' || echo "       /dev/infiniband: 不存在"
+    # ★ RoCE 网卡的有效 GID 列表：平台注入 NCCL_IB_GID_INDEX=7，
+    #   若索引 >= 有效个数，IB 传输初始化会失败。这里把真实的有效索引列出来。
+    for dev in $(ls -1 /sys/class/infiniband 2>/dev/null || true); do
+        for port in $(ls -1 "/sys/class/infiniband/$dev/ports" 2>/dev/null || true); do
+            gdir="/sys/class/infiniband/$dev/ports/$port/gids"
+            if [[ -d "$gdir" ]]; then
+                n=$(ls -1 "$gdir" 2>/dev/null | wc -l | tr -d ' ')
+                echo "       $dev port $port: 有 $n 个 GID 索引（有效范围 0..$((n-1))）"
+                for g in $(ls -1 "$gdir" 2>/dev/null | head -3); do
+                    printf '         gid %s = %s\n' "$g" "$(cat "$gdir/$g" 2>/dev/null)"
+                done
+            fi
+        done
+    done
     echo
     # ★ GPU 拓扑：确认是否存在 P2P。
     #   Blackwell 入门专业卡/消费卡（含 RTX PRO 6000 / RTX 50 系）在普通 PCIe 上
@@ -806,29 +820,37 @@ EOF
 
  候选配置（按成功率排序）：
    A 基线                             —— 保留平台注入的一切
-   B 清掉平台注入的 RDMA 变量          —— 最可能有效：容器内设备若与宿主机
-                                        注入的 NCCL_IB_HCA/GID_INDEX 对不上，
-                                        清掉后 NCCL 退回套接字/共享内存
-   C P2P 关闭 + 清 RDMA 变量           —— 无 P2P 的 Blackwell 卡（社区文档推荐
-                                        NCCL_P2P_DISABLE=1，配合 NCCL≥2.27）
-   D 强制纯套接字                       —— 完全不用设备端 kernel
-   E 关共享内存                         —— 区分 shm 是否瓶颈
+   B 清掉平台注入的 RDMA 变量          —— 容器设备若与宿主机注入的值对不上时有效
+   C P2P 关闭 + 清 RDMA 变量           —— 无 NVLink 的卡
+   D 纯套接字                          —— 完全不用设备端 kernel
+   E 只改 GID 索引为 0                 —— ★ 实测平台注入 NCCL_IB_GID_INDEX=7，
+                                        而 RoCE 网卡通常只有 GID 0..5；索引无效
+                                        会让 IB 传输初始化失败
+   F GID 索引 3 + 关 P2P               —— 同上，换一个常见有效值
+   G 关 P2P + 纯套接字 + GID 0         —— 组合
 EOF
     local cfg_names=(
         "A_基线"
         "B_清RDMA变量"
         "C_关P2P+清RDMA"
         "D_纯套接字"
-        "E_关共享内存"
+        "E_GID索引0"
+        "F_GID索引尝试全部"
+        "G_关P2P+纯套接字"
     )
     # 清掉环境变量的写法：用 env -u 逐个 unset
     local CLEAR_RDMA="env -u NCCL_IB_HCA -u NCCL_IB_GID_INDEX -u NCCL_IB_ADAPTIVE_ROUTING -u NCCL_TOPO_FILE"
+    # ★ 实测平台注入 NCCL_IB_GID_INDEX=7，而 RoCE 网卡通常只有 GID 0..5 ——
+    #   指到不存在的索引会让 IB 传输初始化失败。所以专门试几个有效索引，
+    #   以及"关掉 GID 索引强制探测"。
     local cfg_cmds=(
         "env"
         "$CLEAR_RDMA"
         "$CLEAR_RDMA NCCL_P2P_DISABLE=1"
         "env NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 NCCL_SHM_DISABLE=1"
-        "env NCCL_SHM_DISABLE=1"
+        "env NCCL_IB_GID_INDEX=0"
+        "env NCCL_IB_GID_INDEX=3 NCCL_P2P_DISABLE=1"
+        "env NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 NCCL_SHM_DISABLE=1 NCCL_IB_GID_INDEX=0"
     )
     local worked=()
     local idx
@@ -859,42 +881,42 @@ EOF
         warn "所有配置都失败 —— 这个容器的多卡通信确实不可用"
         cat <<'EOF'
 
- 根因（已确认）：
-   GPU compute capability = sm_120（Blackwell 入门专业卡，96GB，很可能是 RTX PRO 6000）。
-   这类卡在普通 PCIe 上【没有可用的 GPU 点对点(P2P)、也没有 NVLink】；
-   而容器镜像 25.02 里的 NCCL 是 2.25.1 —— 既【不认识 sm_120】，
-   也无法在无 P2P 硬件上正确降级。于是最基本的 4 卡 broadcast 就报
-       Cuda failure 1 'invalid argument'（NCCL enqueue 启动 kernel 失败）
-   1 卡可用，是因为单卡通信不需要跨卡 kernel。
-   参考：Blackwell 无 P2P 机器的多卡问题与修法（社区文档，NCCL 2.28.9 下验证）
-     https://github.com/lna-lab/gemma4-12b-vllm-sm120/blob/main/docs/NO-P2P-MULTIGPU.md
+ 已排除的原因（本自检实测，7 组配置全试）：
+   - 不是 P2P：NCCL_P2P_DISABLE=1 无效
+   - 不是 IB/RDMA：NCCL_IB_DISABLE=1、清掉平台注入的 IB_HCA/GID_INDEX 均无效
+   - 不是共享内存：NCCL_SHM_DISABLE=1 无效
+   - 不是 GID 索引：换成 0 / 3 也无效
+   - 不是平台注入干扰：把平台注入的 RDMA 变量全部清掉仍无效
 
- 完整解法需要【两个条件同时满足】：
-   (1) NCCL 版本 ≥ 2.27（才认识 sm_120）
-   (2) NCCL_P2P_DISABLE=1（绕开不存在的 P2P，退到共享内存/主机暂存）
+ 实测环境（关键事实）：
+   GPU compute_capability = sm_120（Blackwell），显存 97887 MiB
+   GPU 拓扑：GPU 之间是 PHB/SYS（PCIe 主机桥 / NUMA），【没有 NVLink】
+   容器 torch=2.7.0a0+ecf3bae40a.nv25.02  cuda=12.8  nccl=(2,25,1)
+   libnccl.so 在容器内【找不到】-> torch 的 NCCL 是静态链接，无法替换
+   （NCCL 2.25.1 发布于 2025-02，早于 sm_120 支持）
 
- 具体动作：
-   1) ★ 换【更新的镜像】——把 NCCL 带到 2.27+
-      候选（按推荐）：
-        - 社区镜像  pytorch/pytorch:2.9.x-cuda12.8-cudnn9-runtime  或
-          nvcr.io/nvidia/pytorch:26.04-py3 / 26.07-py3（NGC 新 tag，NCCL 很新）
-        - 或任何带 NCCL ≥ 2.27 的 CUDA 12.8/12.9 镜像
-      ⚠️ 换完必须确认日志里 `torch=` 与 `nccl=` 变了（本次仍是 2.7.0a0+..nv25.02）
-   2) 同时在平台执行命令里加：  export NCCL_P2P_DISABLE=1
-   3) 然后跑  GPUS=4 MODE=smoke-ddp bash start.sh  验证
-   4) 还有一处要单独确认：正式训练用的是【.venv 的 torch】，
-      它的 NCCL 由 uv.lock 里的 nvidia-nccl-cu12 决定（当前 2.26.2）。
-      若 .venv 的 NCCL 也偏老，需要把 uv.lock 里的 nvidia-nccl-cu12 升到 2.29.7。
-      （上面已打印 venv 的 nccl 版本，据此判断）
+ 结论：镜像里的 NCCL 太老且换不掉 —— 必须换一个 NCCL ≥ 2.27 的【镜像】。
 
- 备选：若短期拿不到新镜像，只能用 1 卡训练（10 epoch ≈ 11 天，不现实；
-       建议 model.max_epochs=1 先出权重，约 27 小时）
+ 建议动作（按优先级）：
+   1) ★ 换镜像。要求：NCCL ≥ 2.27（越新越好）。
+      你列表里 26.0x-py3（NGC 新 tag）或 2.9.x-cu13 系可作候选。
+      换完用  GPUS=4 MODE=smoke-ddp bash start.sh  复验：
+      只要 [nccl-min] 那行显示 nccl=(2,2X,...) 且 ✅ 通过即可。
+   2) 同时把  export NCCL_P2P_DISABLE=1  加到执行命令（无 NVLink 的卡建议常开）。
+   3) ★ 注意两套 NCCL：正式训练用的是 .venv 的 torch，
+      其 NCCL 由 uv.lock 决定（nvidia-nccl-cu12==2.26.2）。
+      setup_env.sh 已改为自动把它升到 2.29.7，并打印 libnccl.so 来源：
+        [A] torch 自带 -> 换不掉，只能靠换镜像
+        [B] pip 包     -> 升级生效
+   4) 若短期拿不到新镜像：用 1 卡先出权重
+        GPUS=1 bash start.sh model.max_epochs=1      # 约 27 小时
 
- 本机实测数据（可直接提供给平台支持）：
-   torch=2.7.0a0+ecf3bae40a.nv25.02  cuda=12.8  nccl=(2,25,1)  ndev=4
-   GPU0 name='NVIDIA RPBZZZ6'  compute_capability=sm_120  显存 97887 MiB
-   4 卡 dist.broadcast 失败: NCCL enqueue.cc:1500 Cuda failure 1 'invalid argument'
-   5 组 NCCL 配置（含 NCCL_P2P_DISABLE=1 / 关 shm / 关 IB / 无 net 插件）全部失败
+ 可提供给平台支持的实测证据：
+   GPU0 name='NVIDIA RPBZZZ6'  compute_capability=sm_120  97887 MiB
+   torch=2.7.0a0+ecf3bae40a.nv25.02  nccl=(2,25,1)  ndev=4
+   4 卡 dist.broadcast: NCCL enqueue.cc Cuda failure 1 'invalid argument'
+   平台注入 NCCL_IB_HCA=mlx5_2 / NCCL_IB_GID_INDEX=7 / NCCL_SOCKET_IFNAME=eth0
+   7 种 NCCL 配置组合全部失败
 EOF
     else
         ok "以下配置可以跑通 4 卡通信："
