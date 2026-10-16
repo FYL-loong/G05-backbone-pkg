@@ -651,20 +651,32 @@ EOF
 #   实测正式训练在 DDP 构造期间报 illegal memory access，1 卡却正常。
 # ============================================================================
 do_smoke_ddp() {
-    # 优先用项目 venv；没有就用【镜像自带的 python/torch】——
-    # 这样在多卡任务里 1-2 分钟就能出结果，不必先跑 6-8 分钟的 setup。
+    # ★ 关键：要测【正式训练真正使用的那个 torch】。
+    #   容器自带 torch 来自镜像；正式训练用的是 .venv 里的 torch（uv 按 uv.lock 装的）。
+    #   两者 NCCL 可能完全不同 —— 只测容器 torch 会得出"换镜像就行"的错误结论。
+    #   规则：
+    #     - 有 .venv 时【默认用 .venv 的 python】测（这才是正式训练的环境）
+    #     - 没有 .venv 时用容器 python 测，并明确标注"这不是正式训练用的"
+    #     - 可用 G05_SMOKE_IN_VENV=0/1 强制指定
     local PY
-    if [[ -x .venv/bin/python ]]; then
+    local want_venv="${G05_SMOKE_IN_VENV:-auto}"
+    if [[ -x .venv/bin/python && "$want_venv" != "0" ]]; then
         activate_venv
         PY="python"
-        info "使用项目 venv"
+        ok "使用【.venv 的 python】测试 —— 这是正式训练真正使用的环境"
+        python -c "import torch; print('  venv torch', torch.__version__, 'cuda', torch.version.cuda, 'ndev', torch.cuda.device_count())"
+    elif [[ -x .venv/bin/python ]]; then
+        PY="python"
+        warn "G05_SMOKE_IN_VENV=0 —— 强制用【容器自带】python 测（注意：正式训练用的是 .venv）"
     else
         PY="python"
-        warn "没有 .venv —— 用镜像自带的 python/torch（能验通信即可，不必装依赖）"
+        warn "没有 .venv —— 只能用【容器自带】python 测"
+        warn "⚠️ 正式训练用的是 .venv 的 torch，两者 NCCL 不同 —— 本次结果不能代表正式训练"
+        warn "   想测正式训练的环境：先跑 MODE=setup 装出 .venv，再跑 MODE=smoke-ddp"
         if ! python -c "import torch, torch.distributed" 2>/dev/null; then
             fail "镜像自带的 python 没有 torch —— 请先跑 MODE=setup，或用带 torch 的镜像"
         fi
-        python -c "import torch; print('  torch', torch.__version__, 'cuda', torch.version.cuda, 'ndev', torch.cuda.device_count())"
+        python -c "import torch; print('  容器 torch', torch.__version__, 'cuda', torch.version.cuda, 'ndev', torch.cuda.device_count())"
     fi
     local n="${GPUS:-${NPROC_PER_NODE:-${MLP_WORKER_GPU:-${MLP_WORKER_NUM:-$(nvidia-smi -L 2>/dev/null | wc -l | tr -d ' ')}}}}"
     [[ "${n:-0}" -ge 1 ]] || n=1
@@ -728,12 +740,13 @@ do_smoke_ddp() {
         echo
     fi
 
-    # ★ 关键：自检用的是【容器自带 python/torch】，而正式训练用的是【.venv 的 torch】。
-    #   两者的 NCCL 可能不是同一个（venv 由 uv.lock 决定 nvidia-nccl-cu12 的版本）。
-    #   只测一个会出现"自检通过、正式训练仍崩"的假阴性，所以两个都报告。
-    if [[ -x .venv/bin/python ]]; then
+    # ★ 两套 NCCL 必须区分清楚（这是最容易搞错的地方）：
+    #     容器自带 torch 的 NCCL  <- 来自【镜像】     -> 换镜像才能改
+    #     .venv 里 torch 的 NCCL  <- 来自【uv.lock】  -> 换镜像【改不了】，要单独升级
+    #   正式训练用的是后者。所以若此刻用的是容器 python，就把 venv 的情况也打出来对照。
+    if [[ -x .venv/bin/python && "$want_venv" == "0" ]]; then
         echo
-        info "【venv 的 torch/NCCL】—— 这才是正式训练真正使用的："
+        info "【对照组】.venv 的 torch/NCCL（正式训练真正使用的）:"
         .venv/bin/python - <<'PYV' || true
 import glob, os, site
 try:
@@ -780,7 +793,10 @@ except Exception as e:
     print(f"    venv libnccl 查找失败: {e}")
 PYV
     else
-        warn "没有 .venv —— 只能测容器自带的 torch；正式训练的 torch 版本可能不同"
+        warn "只有容器自带的 torch 可测 —— 无 .venv 对照组"
+        warn "⚠️ 本次结果【不能代表正式训练】：正式训练用的是 .venv 的 torch，其 NCCL"
+        warn "   由 uv.lock 决定（与镜像无关，换镜像也改不了）。"
+        warn "   要验证正式训练的环境：先 MODE=setup，再 MODE=smoke-ddp（会自动用 .venv）"
     fi
     echo
 
