@@ -48,6 +48,28 @@ def main() -> int:
                   f"is_nccl_available={dist.is_nccl_available()}", flush=True)
         except Exception as e:  # noqa: BLE001
             print(f"[nccl-min] 读 nccl 可用性失败: {e}", flush=True)
+        # ★ libnccl.so.2 在哪 —— 决定"升级 nvidia-nccl-cu12 pip 包"是否有效：
+        #   在 torch/lib/     -> torch 自带 NCCL，换 pip 包【无效】，得换 torch/镜像
+        #   在 nvidia/nccl/   -> 来自 pip 包，【升级 nvidia-nccl-cu12 就能修】
+        try:
+            import glob
+            import site
+            roots = [os.path.dirname(os.path.dirname(torch.__file__))]
+            try:
+                roots += list(site.getsitepackages())
+            except Exception:  # noqa: BLE001
+                pass
+            found = []
+            for r in dict.fromkeys(roots):
+                found += glob.glob(os.path.join(r, "**", "libnccl.so*"), recursive=True)
+            print(f"[nccl-min] libnccl.so 位置（决定修法，共 {len(found)} 个）:", flush=True)
+            for f in found[:6]:
+                print(f"[nccl-min]     {f}", flush=True)
+            if not found:
+                print("[nccl-min]     （未找到 —— NCCL 可能是静态链接进 torch 的）",
+                      flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[nccl-min] 找 libnccl 失败: {e}", flush=True)
 
     try:
         dist.init_process_group(backend="nccl")
@@ -76,6 +98,9 @@ def main() -> int:
         dist.destroy_process_group()
     except Exception:  # noqa: BLE001
         pass
+
+    # ⚠️ 返回【真实的成功与否】，不要无条件 return 0 ——
+    #    否则失败也会被判为通过（曾经因此漏看结果）。
     return 0 if ok else 1
 
 
