@@ -127,19 +127,76 @@ run_sync "方式1：常规 uv sync" \
 NCCL_VER="${G05_NCCL_VER:-2.29.7}"
 if [[ "${G05_NCCL_UPGRADE:-1}" == "1" ]]; then
     VENV_PY_PRE="$PROJECT_ROOT/.venv/bin/python"
+    NCCL_LIB_DIR="$PROJECT_ROOT/.venv/lib/python3.10/site-packages/nvidia/nccl/lib"
+
     info "把 venv 里的 nvidia-nccl-cu12 升级到 $NCCL_VER（支持 sm_120；不动 torch）"
-    if "$VENV_PY_PRE" -m pip install --quiet --no-deps \
-            "nvidia-nccl-cu12==$NCCL_VER" 2>&1 | tail -5; then
-        ok_sync "nvidia-nccl-cu12==$NCCL_VER（pip 直装）"
+    # ⚠️ 为什么必须强制：torch 2.7.1 的元数据把依赖【精确锁定】为
+    #       nvidia-nccl-cu12==2.26.2
+    #    所以普通 `pip install nvidia-nccl-cu12==2.29.7` 会因依赖冲突被拒绝。
+    #    （上一版就是这么失败的：还因为 `| tail -5` 把 pip 的退出码和错误信息
+    #      一起吞掉，只留下一句"失败"，完全看不到原因。）
+    NCCL_OK=0
+    if "$VENV_PY_PRE" -m pip install --no-deps --force-reinstall \
+            "nvidia-nccl-cu12==$NCCL_VER" > /tmp/nccl_pip.log 2>&1; then
+        NCCL_OK=1
+        ok_sync "nvidia-nccl-cu12==$NCCL_VER（--force-reinstall --no-deps）"
     else
-        warn "升级 nvidia-nccl-cu12 失败（不阻塞）—— 若 4 卡 NCCL 报错请看这里"
+        warn "方式1（--force-reinstall）失败，输出末尾："
+        tail -6 /tmp/nccl_pip.log | sed 's/^/       /' || true
+        # 方式2：装到独立目录再覆盖 .so —— 完全不碰 site-packages 元数据
+        info "尝试方式2：--target 到临时目录，只取 libnccl.so* 覆盖"
+        TMPNCCL="$(mktemp -d)"
+        if "$VENV_PY_PRE" -m pip install --no-deps --target "$TMPNCCL" \
+                "nvidia-nccl-cu12==$NCCL_VER" > /tmp/nccl_pip2.log 2>&1; then
+            SRCDIR="$TMPNCCL/nvidia/nccl/lib"
+            if [[ -d "$SRCDIR" ]]; then
+                mkdir -p "$NCCL_LIB_DIR"
+                # 备份一次，便于回滚。
+                # ⚠️ 注意 glob 必须是 libnccl.so.*（不能是 libnccl.so*），
+                #    否则会把刚做的 .g05bak 备份也一起拷进去。
+                if [[ -f "$NCCL_LIB_DIR/libnccl.so.2" && ! -f "$NCCL_LIB_DIR/libnccl.so.2.g05bak" ]]; then
+                    cp -a "$NCCL_LIB_DIR/libnccl.so.2" "$NCCL_LIB_DIR/libnccl.so.2.g05bak" || true
+                fi
+                for _f in "$SRCDIR"/libnccl.so.*; do
+                    [[ -e "$_f" ]] || continue
+                    cp -a "$_f" "$NCCL_LIB_DIR/" || true
+                    info "  覆盖 $(basename "$_f")"
+                done
+                NCCL_OK=1
+                ok_sync "覆盖 $NCCL_LIB_DIR/libnccl.so.* 成功（方式2）"
+            else
+                warn "方式2：临时目录里没有 nvidia/nccl/lib：$(ls -R "$TMPNCCL" 2>/dev/null | head -10)"
+            fi
+        else
+            warn "方式2 失败，输出末尾："
+            tail -6 /tmp/nccl_pip2.log | sed 's/^/       /' || true
+        fi
+        rm -rf "$TMPNCCL" 2>/dev/null || true
     fi
-    # 立刻验证：torch 报告的是哪个 NCCL？libnccl.so 来自哪里？
-    "$VENV_PY_PRE" - <<'PYNCCL' || true
-import glob, os, site
+
+    if [[ "$NCCL_OK" != "1" ]]; then
+        warn "两种方式都失败 —— NCCL 仍是旧版，4 卡会失败。请把上面 pip 的错误贴出来。"
+    fi
+
+    # ★ 强制验证：不看安装日志，只看【torch 实际加载的是哪个版本】。
+    #   这一条是唯一可信的判据。
+    info "验证 torch 实际加载的 NCCL："
+    "$VENV_PY_PRE" - "$NCCL_VER" <<'PYNCCL' || true
+import glob, os, site, sys
+want_str = sys.argv[1] if len(sys.argv) > 1 else "?"
 try:
     import torch
-    print(f"[nccl] torch={torch.__version__}  torch 报告 nccl={torch.cuda.nccl.version()}")
+    got = torch.cuda.nccl.version()
+    print(f"[nccl] torch={torch.__version__}  torch 实际加载的 nccl={got}")
+    try:
+        want = tuple(int(x) for x in want_str.split("."))
+    except Exception:
+        want = None
+    if want and tuple(got) >= want:
+        print(f"[nccl] ✅ 升级【生效】：{got}（目标 {want_str}）")
+    else:
+        print(f"[nccl] ❌ 升级【未生效】：仍是 {got}（目标 {want_str}）"
+              f" —— 4 卡会失败，请把上面的 pip 错误贴出来")
 except Exception as e:
     print(f"[nccl] 读 torch 失败: {type(e).__name__}: {e}")
 try:
@@ -167,6 +224,18 @@ try:
 except Exception as e:
     print(f"[nccl] 查找 libnccl 失败: {e}")
 PYNCCL
+    # 硬判定：NCCL < 2.27 时 sm_120 多卡必失败，明确劝阻跑正式任务
+    if ! "$VENV_PY_PRE" -c "
+import sys, torch
+got = tuple(torch.cuda.nccl.version())
+print(f'[nccl] 判定: nccl={got}  sm_120 需要 >=2.27  ->  ' + ('通过 ✅' if got >= (2,27) else '不通过 ❌'))
+sys.exit(0 if got >= (2,27) else 3)
+" ; then
+        warn "venv 的 NCCL < 2.27 —— 4 卡训练会失败，【不要跑正式任务】"
+        warn "  选项：a) 换镜像（NGC 26.0x-py3 等含新 NCCL 的）"
+        warn "        b) 先把 pip 报错贴出来，我来定 2.29.7 的正确装法"
+        warn "        c) 改用 1 卡：GPUS=1 bash start.sh model.max_epochs=1（约 27 小时）"
+    fi
 else
     info "G05_NCCL_UPGRADE=0 —— 不改 NCCL（sm_120 上 4 卡会失败）"
 fi
