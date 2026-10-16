@@ -955,6 +955,60 @@ def finetune(cfg: DictConfig):
         f"Wrapping model with DDP... (gradient_as_bucket_view={_bucket_view}"
         f"{'，零拷贝优化；若出现 illegal memory access 请置 0' if _bucket_view else '，稳定优先'})"
     )
+
+    # ---- G05_DEBUG_DDP_BCAST=1：逐个参数 broadcast 探针 ----------------------
+    # 为什么需要它：实测 4 卡死在 `DDP(...)` 构造【内部】（train.log 最后一行就是
+    # "Wrapping model with DDP..."），报
+    #     NCCL WARN enqueue.cc:1556 Cuda failure 700 'an illegal memory access'
+    # DDP 构造的第一步是 _sync_params_and_buffers() —— 把每个 param/buffer 广播一遍。
+    # 所以这里手动【逐个】broadcast + synchronize：
+    #   - 某个参数引爆 -> 日志打印它的名字，直接指认元凶
+    #   - 945 个全过   -> 问题不在 broadcast，而在 DDP 内部别处
+    # 代价：每个参数一次同步，几分钟；只在排错时开。
+    if os.environ.get("G05_DEBUG_DDP_BCAST", "0") == "1" and dist.is_initialized():
+        _n_total = sum(1 for _ in model.parameters())
+        logger.info(f"[bcast probe] 逐个 broadcast {_n_total} 个参数 ...")
+        _i = 0
+        _hit = None
+        for _name, _p in model.named_parameters():
+            _i += 1
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                dist.broadcast(_p.data, src=0)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+            except Exception as _e:  # noqa: BLE001
+                _hit = _name
+                logger.error(
+                    f"[bcast probe] ★★★ 第 {_i}/{_n_total} 个参数失败: {_name} "
+                    f"shape={tuple(_p.shape)} dtype={_p.dtype} device={_p.device} "
+                    f"contig={_p.is_contiguous()} ptr={_p.data_ptr()} "
+                    f"stride={_p.stride()} -> {type(_e).__name__}: {_e}"
+                )
+                break
+            if _i == 1 or _i % 100 == 0:
+                logger.info(f"[bcast probe] {_i}/{_n_total} OK （最近: {_name}）")
+        if _hit is None:
+            logger.info(f"[bcast probe] 全部 {_n_total} 个参数 broadcast 通过 ✅")
+        _bn = 0
+        for _name, _b in model.named_buffers():
+            _bn += 1
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                dist.broadcast(_b, src=0)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+            except Exception as _e:  # noqa: BLE001
+                logger.error(
+                    f"[bcast probe] ★★★ buffer 失败: {_name} shape={tuple(_b.shape)} "
+                    f"dtype={_b.dtype} device={_b.device} ptr={_b.data_ptr()} -> "
+                    f"{type(_e).__name__}: {_e}"
+                )
+                break
+        logger.info(f"[bcast probe] buffer 检查了 {_bn} 个")
+
     model = DDP(
         model,
         device_ids=[device_id],
