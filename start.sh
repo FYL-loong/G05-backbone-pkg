@@ -75,19 +75,6 @@ export TQDM_MINITERS="${TQDM_MINITERS:-50}"
 # 关掉 Python 的 DeprecationWarning / FutureWarning 刷屏
 export PYTHONWARNINGS="${PYTHONWARNINGS:-ignore}"
 
-# ------------------------------------------------- CUDA 调试开关（按需打开）
-# G05_DEBUG_CUDA=1 打开后：
-#   CUDA_LAUNCH_BLOCKING=1  —— 让 CUDA 调用同步执行，"illegal memory access"
-#                              会停在真正犯错的那个 kernel 上（默认是异步报的，
-#                              栈会指向无关 API）。慢很多，只在排错时开。
-#   TORCH_USE_CUDA_DSA=1    —— 打开 device-side assert，能指出越界的下标。
-# 实测踩过：4 卡正式训练在【DDP 构造函数内部】报 illegal memory access，
-# 而 1 卡（L4 过拟合）正常，没有 Python traceback，只能靠它定位。
-if [[ "${G05_DEBUG_CUDA:-0}" == "1" ]]; then
-    export CUDA_LAUNCH_BLOCKING=1
-    export TORCH_USE_CUDA_DSA=1
-    warn "G05_DEBUG_CUDA=1 —— 已开 CUDA_LAUNCH_BLOCKING + TORCH_USE_CUDA_DSA（会变慢）"
-fi
 # G05_DEBUG_DDP=1：在 DDP 构造前打印所有 param/buffer 的 设备/dtype/连续性
 export G05_DEBUG_DDP="${G05_DEBUG_DDP:-0}"
 
@@ -114,6 +101,20 @@ ok()   { printf "${C_G}[ OK ]${C_0} %s\n" "$*"; }
 warn() { printf "${C_Y}[WARN]${C_0} %s\n" "$*"; }
 fail() { printf "${C_R}[FAIL]${C_0} %s\n" "$*" >&2; exit 1; }
 step() { printf "\n${C_C}========================================================${C_0}\n${C_C} %s${C_0}\n${C_C}========================================================${C_0}\n" "$*"; }
+
+# ------------------------------------------------- CUDA 调试开关（按需打开）
+# ⚠️ 必须放在工具函数【之后】—— 它用到 warn()。曾经放在前面，导致
+#    "start.sh: line 89: warn: command not found"，脚本第 4 行就死了，
+#    而 `bash -n` 语法检查查不出"函数未定义"这种错误。
+# G05_DEBUG_CUDA=1：
+#   CUDA_LAUNCH_BLOCKING=1  让 CUDA 调用同步执行，"illegal memory access" 会停在
+#                           真正犯错的 kernel 上（默认异步报，栈指向无关 API）
+#   TORCH_USE_CUDA_DSA=1    打开 device-side assert，能指出越界下标
+if [[ "${G05_DEBUG_CUDA:-0}" == "1" ]]; then
+    export CUDA_LAUNCH_BLOCKING=1
+    export TORCH_USE_CUDA_DSA=1
+    warn "G05_DEBUG_CUDA=1 —— 已开 CUDA_LAUNCH_BLOCKING + TORCH_USE_CUDA_DSA（会变慢）"
+fi
 
 # 激活 venv。activate 脚本在 set -u 下可能引用未定义变量而退出，故临时关 -u。
 activate_venv() {
