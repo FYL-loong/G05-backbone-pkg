@@ -5,7 +5,7 @@
 # 为什么需要这个脚本：
 #   官方 README 里的 smoke test 是
 #       bash scripts/run/finetune.sh 1 yam --test --max_datasets 1 \
-#            model.pretrained_ckpt=null model.max_steps=10
+#            model.pretrained_ckpt=null model.max_steps=10 model.max_epochs=null
 #   `pretrained_ckpt=null` 会让 scripts/finetune.py 走
 #       else: model = instantiate(cfg.model.model_arch)      # 随机初始化
 #   这条分支（finetune.py:572-573），【完全不加载】那 11GB 权重。
@@ -80,6 +80,11 @@ find "$G05_OUTPUT_DIR" -maxdepth 3 -type d 2>/dev/null | sort > "$BEFORE"
 
 # ---- 跑 2 步（显式加载权重）----------------------------------------------
 # 输出同时进 tee 和一个固定路径的日志，便于之后自动解析
+#
+# ⚠️ max_epochs 与 max_steps 互斥（scripts/finetune.py:877 有 assert）：
+#    configs/task/yam.yaml 里 max_epochs=10（task 覆盖 model），所以这里用
+#    max_steps 限步时必须同时把 max_epochs 置 null，否则报
+#    "Cannot set both `max_epochs` and `max_steps`!"。
 RUNLOG="${LOG:-$(pwd)/verify_weight_load.log}"
 info "开始：加载权重 + 跑 $STEPS 步（日志 -> $RUNLOG）"
 echo "--------------------------------------------------------------"
@@ -87,7 +92,8 @@ set +e
 bash scripts/run/finetune.sh "$GPUS" "$TASK" \
     --test --max_datasets 1 \
     "model.pretrained_ckpt=$CKPT" \
-    "model.max_steps=$STEPS" 2>&1 | tee "$RUNLOG"
+    "model.max_steps=$STEPS" \
+    "model.max_epochs=null" 2>&1 | tee "$RUNLOG"
 rc="${PIPESTATUS[0]}"
 set -e
 echo "--------------------------------------------------------------"

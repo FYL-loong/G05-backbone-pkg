@@ -266,13 +266,19 @@ PY
 do_verify() {
     activate_venv
 
+    # ⚠️ max_epochs 与 max_steps 互斥（finetune.py:877 有 assert）：
+    #    configs/task/yam.yaml 里 max_epochs=10（task 覆盖 model），所以任何想用
+    #    max_steps 限步的地方，都必须同时把 max_epochs 置 null，否则报
+    #    "Cannot set both `max_epochs` and `max_steps`!"。
+    local NO_EPOCH="model.max_epochs=null"
+
     step "L1 配置组装（不加载权重、不占显存）"
     bash scripts/run/finetune.sh 1 yam --dry-run --max_datasets 1
     ok "L1 通过"
 
     step "L2 数据管线 + forward/backward（权重随机初始化，不验证权重加载）"
     bash scripts/run/finetune.sh 1 yam --test --max_datasets 1 \
-        model.pretrained_ckpt=null model.max_steps=10 logger.mode=offline
+        model.pretrained_ckpt=null model.max_steps=10 "$NO_EPOCH" logger.mode=offline
     ok "L2 通过（数据管线没崩）"
 
     step "L3 ★ 权重加载验证（11GB 加载；脚本自动判定并返回门禁退出码）"
@@ -283,8 +289,8 @@ do_verify() {
         warn "SKIP_L4=1，跳过 L4"
     else
         step "L4 单批过拟合（loss 应明显下降）"
-        bash scripts/run/finetune.sh 1 yam --overfit_batch 5 model.max_steps=500 \
-            logger.mode=offline
+        bash scripts/run/finetune.sh 1 yam --overfit_batch 5 \
+            model.max_steps=500 "$NO_EPOCH" logger.mode=offline
         ok "L4 跑完（请确认上面 loss 明显下降）"
     fi
 }
