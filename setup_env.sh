@@ -130,29 +130,50 @@ if [[ "${G05_NCCL_UPGRADE:-1}" == "1" ]]; then
     NCCL_LIB_DIR="$PROJECT_ROOT/.venv/lib/python3.10/site-packages/nvidia/nccl/lib"
 
     info "把 venv 里的 nvidia-nccl-cu12 升级到 $NCCL_VER（支持 sm_120；不动 torch）"
-    # ⚠️ 为什么必须强制：torch 2.7.1 的元数据把依赖【精确锁定】为
-    #       nvidia-nccl-cu12==2.26.2
-    #    所以普通 `pip install nvidia-nccl-cu12==2.29.7` 会因依赖冲突被拒绝。
-    #    （上一版就是这么失败的：还因为 `| tail -5` 把 pip 的退出码和错误信息
-    #      一起吞掉，只留下一句"失败"，完全看不到原因。）
+    # ⚠️ 踩过的坑（两次失败都出在这里）：
+    #   1) `pip install nvidia-nccl-cu12==2.29.7` 被拒 —— torch 2.7.1 的元数据把它
+    #      【精确锁定】为 ==2.26.2。
+    #   2) **`.venv/bin/python -m pip` 直接报 `No module named pip`** ——
+    #      uv 创建的 venv 默认【不安装 pip】。所以任何 `python -m pip` 都跑不了。
+    #   正确做法：用 `uv pip`（uv 能管理自己创建的 venv，无需 pip），
+    #             并加 --no-deps 绕开 torch 的精确版本锁。
     NCCL_OK=0
-    if "$VENV_PY_PRE" -m pip install --no-deps --force-reinstall \
-            "nvidia-nccl-cu12==$NCCL_VER" > /tmp/nccl_pip.log 2>&1; then
-        NCCL_OK=1
-        ok_sync "nvidia-nccl-cu12==$NCCL_VER（--force-reinstall --no-deps）"
+    NCCL_LOG=/tmp/nccl_upgrade.log
+    : > "$NCCL_LOG"
+
+    _try_nccl() {
+        local desc="$1"; shift
+        info "尝试：$desc"
+        : > "$NCCL_LOG"          # 每次清空，避免打印出上一次的旧报错
+        if "$@" >>"$NCCL_LOG" 2>&1; then
+            NCCL_OK=1
+            return 0
+        fi
+        warn "失败：$desc（输出末尾 8 行）"
+        tail -8 "$NCCL_LOG" | sed 's/^/       /' || true
+        return 1
+    }
+
+    # 方式1：uv pip —— 首选（uv 能管理自己创建的 venv，不需要 pip）
+    _try_nccl "uv pip install --no-deps nvidia-nccl-cu12==$NCCL_VER（--python .venv）" \
+        uv pip install --python "$VENV_PY_PRE" --no-deps \
+        "nvidia-nccl-cu12==$NCCL_VER" \
+      || _try_nccl "uv pip install --no-deps --reinstall ..." \
+        uv pip install --python "$VENV_PY_PRE" --no-deps --reinstall \
+        "nvidia-nccl-cu12==$NCCL_VER"
+
+    if [[ "$NCCL_OK" == "1" ]]; then
+        ok_sync "nvidia-nccl-cu12==$NCCL_VER（uv pip）"
     else
-        warn "方式1（--force-reinstall）失败，输出末尾："
-        tail -6 /tmp/nccl_pip.log | sed 's/^/       /' || true
-        # 方式2：装到独立目录再覆盖 .so —— 完全不碰 site-packages 元数据
-        info "尝试方式2：--target 到临时目录，只取 libnccl.so* 覆盖"
+        # 方式2：--target 装到临时目录，只覆盖 .so（完全不碰 site-packages 元数据）
+        info "尝试兜底方式：--target 到临时目录，只取 libnccl.so.* 覆盖"
         TMPNCCL="$(mktemp -d)"
-        if "$VENV_PY_PRE" -m pip install --no-deps --target "$TMPNCCL" \
-                "nvidia-nccl-cu12==$NCCL_VER" > /tmp/nccl_pip2.log 2>&1; then
+        if uv pip install --python "$VENV_PY_PRE" --no-deps --target "$TMPNCCL" \
+                "nvidia-nccl-cu12==$NCCL_VER" >>"$NCCL_LOG" 2>&1; then
             SRCDIR="$TMPNCCL/nvidia/nccl/lib"
             if [[ -d "$SRCDIR" ]]; then
                 mkdir -p "$NCCL_LIB_DIR"
-                # 备份一次，便于回滚。
-                # ⚠️ 注意 glob 必须是 libnccl.so.*（不能是 libnccl.so*），
+                # ⚠️ glob 必须是 libnccl.so.*（不能是 libnccl.so*），
                 #    否则会把刚做的 .g05bak 备份也一起拷进去。
                 if [[ -f "$NCCL_LIB_DIR/libnccl.so.2" && ! -f "$NCCL_LIB_DIR/libnccl.so.2.g05bak" ]]; then
                     cp -a "$NCCL_LIB_DIR/libnccl.so.2" "$NCCL_LIB_DIR/libnccl.so.2.g05bak" || true
@@ -163,19 +184,19 @@ if [[ "${G05_NCCL_UPGRADE:-1}" == "1" ]]; then
                     info "  覆盖 $(basename "$_f")"
                 done
                 NCCL_OK=1
-                ok_sync "覆盖 $NCCL_LIB_DIR/libnccl.so.* 成功（方式2）"
+                ok_sync "覆盖 $NCCL_LIB_DIR/libnccl.so.* 成功（兜底方式）"
             else
-                warn "方式2：临时目录里没有 nvidia/nccl/lib：$(ls -R "$TMPNCCL" 2>/dev/null | head -10)"
+                warn "临时目录里没有 nvidia/nccl/lib：$(ls -R "$TMPNCCL" 2>/dev/null | head -10)"
             fi
         else
-            warn "方式2 失败，输出末尾："
-            tail -6 /tmp/nccl_pip2.log | sed 's/^/       /' || true
+            warn "兜底方式也失败，输出末尾："
+            tail -8 "$NCCL_LOG" | sed 's/^/       /' || true
         fi
         rm -rf "$TMPNCCL" 2>/dev/null || true
     fi
 
     if [[ "$NCCL_OK" != "1" ]]; then
-        warn "两种方式都失败 —— NCCL 仍是旧版，4 卡会失败。请把上面 pip 的错误贴出来。"
+        warn "全部方式都失败 —— NCCL 仍是旧版，4 卡会失败。完整日志：$NCCL_LOG"
     fi
 
     # ★ 强制验证：不看安装日志，只看【torch 实际加载的是哪个版本】。
