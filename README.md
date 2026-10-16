@@ -180,6 +180,40 @@ ValueError: Operation creation failed
 刷 1 万条、每条还内嵌一大段异常。现在改为**第 1 次完整打印、之后每 500 次打一条摘要、
 最后一次完整打印** —— 既省日志又不丢关键信息。
 
+### 快速自检 `MODE=smoke`（**强烈建议：正式跑之前先来一次**）
+
+**为什么需要它**：正式任务要先花 **~12 分钟**下载 11.44GB 权重 + ~20GB 数据集才进
+`finetune.py`。但踩过的坑里有好几个是**配置/参数级**的，本来几秒就能发现 ——
+例如 `Cannot set both max_epochs and max_steps`，那个断言在 `finetune.py:877`，
+**发生在任何下载之前**，却被下载埋到第 17 分钟才暴露。
+
+```bash
+MODE=smoke bash start.sh      # 约 1 分钟，不下载权重/数据，不跑训练
+```
+
+它检查三件事：
+
+| # | 检查 | 能抓到的坑 |
+|---|---|---|
+| 1 | **包完整性**（155 条 `g05.*` import 是否可解析） | 抽包漏文件、`.gitignore` 误吞源码目录 |
+| 2 | **配置自检**（Hydra 组装 → `validate_train_config` → `max_epochs`/`max_steps` 互斥） | override key 拼错、参数冲突、缺数据目录。**默认 / L2 `--test` / L4 `--overfit` 三条路径都验** |
+| 3 | **视频解码**（真造一个小 MP4，用代码里同一套判据决定后端） | `torchcodec` 缺系统 FFmpeg 共享库（会回退 `pyav`） |
+
+`MODE=smoke` 不需要 `.venv`（有就用、没有就用镜像自带的 python），所以**装环境之前也能跑**。
+
+**没验的**（只能靠真实运行，但已收在一次任务里）：
+11.44GB 权重完整加载（L3）、flash-attn/CuTe kernel 编译（已默认绕开走 SDPA）、
+显存是否够、DDP 是否正常。
+
+单独跑配置自检也可以（进了容器后在项目目录下）：
+
+```bash
+source .venv/bin/activate
+python config_check.py                                    # 默认 task=yam
+python config_check.py --test-mode model.max_steps=10 model.max_epochs=null
+python config_check.py --overfit   model.max_steps=500 model.max_epochs=null
+```
+
 ### 一条命令（全自动，无人值守）
 
 平台任务的「执行命令」框里填这一条 —— **不需要任何 MODE 参数**：
@@ -236,6 +270,7 @@ bash start.sh
 MODE=setup  bash start.sh     # 只装环境 + 拉权重/数据 + 校验（不训练）
 MODE=verify bash start.sh     # 只跑 L1/L2/L3/L4（不含 L3 之后的训练）
 MODE=train  bash start.sh     # 只启动训练（环境/数据须已就绪）
+MODE=smoke  bash start.sh     # ★ 快速自检（约 1 分钟，不下载不训练）
 ```
 
 #### 建议：首次先用 **1 卡** 验证环境

@@ -19,6 +19,8 @@
 # 其余带默认值的变量见下方「环境变量」段，一般不需要手动指定。
 #
 # 分阶段（调试用）：
+#   MODE=smoke   bash start.sh    ★快速自检（~1 分钟，不下载权重/数据、不训练）
+#                                建议正式跑之前先来一次，抓配置级错误
 #   MODE=setup   bash start.sh    装环境 + 拉权重/数据 + 自检
 #   MODE=verify  bash start.sh    只跑 L1/L2/L3/L4
 #   MODE=train   bash start.sh    只启动训练（环境/数据须已就绪）
@@ -147,6 +149,23 @@ if [[ -f check_package.py ]]; then
 else
     warn "没有 check_package.py，跳过包完整性检查"
 fi
+
+# ---- 配置自检（只在 .venv 已就绪时跑；否则 setup 装完环境再跑）----
+# 这一层专抓"配置/参数级"错误，几秒出结果。曾经踩过：
+#   `Cannot set both max_epochs and max_steps`（task=yam 把 max_epochs 覆盖成 10，
+#   又与命令行 max_steps 冲突）—— 该断言在 finetune.py:877，**发生在任何下载之前**，
+#   却被 12 分钟的下载埋到第 17 分钟才暴露。现在提前到几秒。
+config_check_now() {
+    [[ -x .venv/bin/python ]] || return 0
+    [[ -f config_check.py ]] || return 0
+    info "配置自检（几秒，不需要 GPU/权重/数据）..."
+    if .venv/bin/python config_check.py "$@" ; then
+        ok "配置自检通过"
+    else
+        fail "配置自检失败 —— 见上方原因（这是【配置/传参】问题，不必下载权重）"
+    fi
+}
+config_check_now
 
 if nvidia-smi >/dev/null 2>&1; then
     info "GPU:"
@@ -412,8 +431,102 @@ EOF
     fi
 }
 
+# ============================================================================
+# smoke：只做"便宜但高价值"的检查，不下载权重/数据、不跑训练
+#   目的：把"配置级 / 库可用性"问题从 ~20 分钟压到 ~1 分钟暴露。
+#   已覆盖的坑：max_epochs/max_steps 冲突、缺源码目录、torchcodec 缺 FFmpeg。
+# ============================================================================
+do_smoke() {
+    # 优先用项目 venv；没有就用系统 python（镜像自带 torch）。
+    # 这样 smoke 在【装环境之前】就能跑，最早暴露问题。
+    local PY
+    if [[ -x .venv/bin/python ]]; then
+        PY=".venv/bin/python"
+        info "使用项目 venv：$PY"
+    else
+        PY="python"
+        warn "没有 .venv，用系统 python（镜像自带的 torch）"
+    fi
+
+    step "smoke 1/3 包完整性（g05.* import 是否都能解析）"
+    python check_package.py . && ok "包完整性通过" || fail "包完整性失败（代码缺文件）"
+
+    step "smoke 2/3 配置自检（hydra 组装 + validate + 互斥检查）"
+    # 三条路径都验：默认、L2 的 --test、L4 的 --overfit
+    "$PY" config_check.py task=yam \
+        && ok "配置自检通过（task=yam 默认路径）" \
+        || fail "配置自检失败（task=yam）"
+    "$PY" config_check.py --test-mode \
+        model.pretrained_ckpt=null model.max_steps=10 model.max_epochs=null \
+        && ok "配置自检通过（L2 --test 路径）" \
+        || fail "配置自检失败（L2 --test 路径）"
+    "$PY" config_check.py --overfit \
+        model.max_steps=500 model.max_epochs=null \
+        && ok "配置自检通过（L4 --overfit 路径）" \
+        || fail "配置自检失败（L4 --overfit 路径）"
+
+    step "smoke 3/3 视频解码后端（真实解码一个样本；不需要数据集）"
+    "$PY" - <<'PY'
+import os, sys, tempfile, traceback
+print(f"  G05_VIDEO_BACKEND = {os.environ.get('G05_VIDEO_BACKEND', '<未设，自动探测>')}")
+try:
+    import numpy as np, torch, torchvision
+except Exception as e:
+    print(f"  [WARN] torch/torchvision 不可用，跳过：{type(e).__name__}: {e}")
+    sys.exit(0)
+
+# 造一个小视频，用代码里同一套判据决定后端
+rng = np.random.default_rng(0)
+frames = rng.integers(0, 255, size=(16, 64, 64, 3), dtype=np.uint8)
+tmp = tempfile.mkdtemp(prefix="smoke_vid_")
+path = os.path.join(tmp, "probe.mp4")
+torchvision.io.write_video(path, torch.from_numpy(frames), fps=8)
+
+# 1) torchcodec 真实可用性（与 src/g05/.../video_utils.py 的探测一致）
+tc_ok = False
+try:
+    from torchcodec.decoders import VideoDecoder
+    md = VideoDecoder(path, device="cpu").metadata
+    tc_ok = True
+    print(f"  torchcodec: OK（metadata 读取成功，平均 fps={md.average_fps}）")
+except Exception as e:
+    print(f"  torchcodec: 不可用 -> {type(e).__name__}: {str(e).splitlines()[0][:140]}")
+    print("             （缺系统 FFmpeg 共享库时就是这样；会回退 pyav）")
+
+# 2) pyav 路径（torchvision 的 pyav 后端）—— 这是回退方案，必须能用
+try:
+    from g05.data.lerobot.datasets.video_utils import decode_video_frames
+    for backend in (["pyav"] if not tc_ok else ["torchcodec", "pyav"]):
+        out = decode_video_frames(path, [0.0, 0.5, 1.0], tolerance_s=1e-3, backend=backend)
+        print(f"  decode_video_frames(backend={backend}): OK  shape={tuple(out.shape)}")
+except Exception as e:
+    print(f"  [FAIL] decode_video_frames 失败：{type(e).__name__}: {e}")
+    traceback.print_exc()
+    sys.exit(1)
+
+import shutil; shutil.rmtree(tmp, ignore_errors=True)
+if not tc_ok:
+    print("  → 结论：torchcodec 不可用但 pyav 可用，训练会走 pyav（预期行为）")
+PY
+    ok "视频解码检查完成（若 torchcodec 不可用，pyav 可用即通过）"
+
+    step "smoke 结束"
+    cat <<'EOF'
+ smoke 检查的都是"便宜但高价值"的项：
+   1. 代码完整性（缺文件/被 .gitignore 吞）
+   2. 配置可组装 + 校验通过 + max_epochs/max_steps 不冲突
+   3. 视频解码后端真实可用（不用下载数据集）
+
+ 没验的（仍需真实运行，但可以放到正式任务里一次跑完）：
+   - 11.44GB 权重能否完整加载（L3）
+   - flash-attn / CuTe kernel 能否编译（已默认绕开，用 SDPA）
+   - 显存是否够、DDP 是否正常
+EOF
+}
+
 # ---------------------------------------------------------------- 分发
 case "$MODE" in
+    smoke)  do_smoke ;;
     setup)  do_setup ;;
     verify) do_verify ;;
     train)  do_train ;;
