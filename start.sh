@@ -73,31 +73,28 @@ export NCCL_DEBUG_SUBSYS="${NCCL_DEBUG_SUBSYS:-INIT,NET}"
 # tqdm 进度条每步刷新会产生大量行；降低刷新频率（只影响观感，不影响训练）
 export TQDM_MININTERVAL="${TQDM_MININTERVAL:-10}"
 export TQDM_MINITERS="${TQDM_MINITERS:-50}"
-# ------------------------------------------------- NCCL：绕开不匹配的 HPC-X 插件
-# ★ 这是 4 卡训练报 "CUDA error: an illegal memory access" 的根因。
+# ------------------------------------------------- NCCL：尊重平台注入，只做必要干预
 #
-# 证据（train.stdout.log）：
-#   NCCL INFO NET/Plugin: Failed to find ncclNetPlugin_v10 symbol.
-#   NCCL INFO NET/Plugin: Loaded net plugin NCCL RDMA Plugin v9 (v9)      <- 退回 v9
-#   NCCL INFO Plugin Path : /opt/hpcx/nccl_rdma_sharp_plugin/lib/libnccl-net.so
-#   NCCL INFO P2P plugin v9 IBext_v9
-#   NCCL INFO Using network NCCL RDMA Plugin v9
+# 【踩过的弯路，记录以免重犯】
+# 曾在这里硬编码 NCCL_NET_PLUGIN=none / NCCL_IB_DISABLE=1 / NCCL_SHARP_DISABLE=1，
+# 以为"单机多卡不需要 RDMA"。实测证明【无效且有害】：
+#   - 无效：那几组配置全试过，4 卡 broadcast 依旧失败
+#   - 有害：百度百舸的文档明确说「开启 RDMA 后平台会注入推荐的 NCCL 环境变量
+#           （NCCL_IB_HCA / NCCL_IB_GID_INDEX / NCCL_IB_TIMEOUT / NCCL_TOPO_FILE …），
+#           强烈建议使用平台预置的 NCCL 默认变量」。硬编码 IB_DISABLE=1 会
+#           【直接废掉 RDMA】—— 一旦以后要跑多机就踩坑。
+#   已确认平台确实注入了 NCCL_SOCKET_IFNAME、NCCL_IB_ADAPTIVE_ROUTING=0（日志可见）。
 #
-# 容器自带的 NCCL 是 2.26.2（期望插件实现 v10 接口），而 /opt/hpcx 里的
-# RDMA/SHARP 插件只提供 v9 —— **ABI 不匹配的原生插件被加载并使用**，
-# 在第一次通信（DDP broadcast + P2P 建链）时越界访问设备内存。
-# 这解释了全部现象：
-#   - 1 卡正常 / 4 卡崩       （P2P 插件只在多卡参与时被调用）
-#   - 崩在 DDP broadcast      （第一次真正通信）
-#   - 参数/buffer 全部干净    （与模型无关）
-#
-# 单机多卡【不需要】IB/RDMA：同机通信走 NVLink/P2P + 共享内存更快。
-# 所以直接禁掉插件与 IB。这些都可被外部环境变量覆盖。
-export NCCL_NET_PLUGIN="${NCCL_NET_PLUGIN:-none}"      # 不加载外部 net 插件
-export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"         # 关 IB/RoCE
-export NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-NVL}"         # 同机 P2P 走 NVLink
-export NCCL_SHARP_DISABLE="${NCCL_SHARP_DISABLE:-1}"   # 关 SHARP（collnet 插件）
+# 现在的原则：**不覆盖平台的注入**。只在平台【没设】时才补默认值，且只补真正安全的。
+export NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-NVL}"          # 同机 P2P 优先 NVLink；无 NVLink 时 NCCL 自行降级
+export NCCL_SHARP_DISABLE="${NCCL_SHARP_DISABLE:-1}"    # 关 SHARP（我们没开 collnet）
 export NCCL_COLLNET_ENABLE="${NCCL_COLLNET_ENABLE:-0}"  # 关 collnet
+# ⚠️ 不设 NCCL_IB_DISABLE / NCCL_NET_PLUGIN / NCCL_P2P_DISABLE ——
+#    交回给平台与环境变量，避免与 RDMA 预设冲突。
+#
+# 若确实需要（无 P2P 的 Blackwell 卡：sm_120 且无 NVLink）：
+#   平台执行命令里加  export NCCL_P2P_DISABLE=1
+#   且 NCCL 版本必须 ≥ 2.27（2.25.1 does not know sm_120，连降级都做不到）
 
 # 关掉 Python 的 DeprecationWarning / FutureWarning 刷屏
 export PYTHONWARNINGS="${PYTHONWARNINGS:-ignore}"
@@ -673,6 +670,17 @@ do_smoke_ddp() {
     [[ "${n:-0}" -ge 1 ]] || n=1
     info "多卡自检，GPU 数=$n"
 
+    # ★ 打印【平台注入的 NCCL 变量】—— 百舸文档说：开启 RDMA 后平台会自动注入
+    #   NCCL_IB_HCA / NCCL_IB_GID_INDEX / NCCL_IB_TIMEOUT / NCCL_TOPO_FILE 等，
+    #   并"强烈建议使用平台预置的默认变量"。看清平台给了什么，才知道该不该动。
+    info "平台/环境注入的 NCCL 变量："
+    env | grep -E '^NCCL_' | sort | sed 's/^/       /' || echo "       （无 —— 可能未开启 RDMA）"
+    info "平台注入的 PyTorch 分布式变量："
+    for v in MASTER_ADDR MASTER_PORT RANK WORLD_SIZE NPROC_PER_NODE LOCAL_RANK \
+             MLP_WORKER_NUM MLP_WORKER_GPU MLP_ROLE_INDEX MLP_WORKER_0_HOST; do
+        if [[ -n "${!v:-}" ]]; then printf '       %-18s = %s\n' "$v" "${!v}"; fi
+    done
+    echo
     # ★ GPU 拓扑：确认是否存在 P2P。
     #   Blackwell 入门专业卡/消费卡（含 RTX PRO 6000 / RTX 50 系）在普通 PCIe 上
     #   通常【没有可用的 P2P、也没有 NVLink】。
