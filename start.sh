@@ -696,32 +696,35 @@ EOF
     fi
 
     # ---- 失败：自动尝试一组 NCCL 配置，找出哪种能跑通 --------------------
-    # 实测第 1 步 dist.broadcast 就报 "Cuda failure 1 'invalid argument'"
-    # （用镜像自带 torch、极小模型、无数据集），说明【多卡通信机制】不被支持。
-    # 与其一轮一轮排队试，不如一次把候选配置全试一遍。
-    warn "多卡自检失败 rc=$rc —— 自动尝试以下 NCCL 配置（每个约 20 秒）"
+    # 实测：GPU 是 sm_120（Blackwell），镜像 25.02 里 NCCL 2.25.1 —— 太老，
+    # 没有为 sm_120 编译的设备端 kernel，所以连最基本的 broadcast 都报
+    #     Cuda failure 1 'invalid argument'（enqueue.cc:1500，kernel 启动失败）
+    # 而 1 卡正常（单卡不需要跨卡 kernel）。
+    # 下面按"最可能有效"排序：先试【完全绕开设备端 kernel】的套接字路径。
+    warn "多卡自检失败 rc=$rc —— 自动尝试以下 NCCL 配置（每个约 15 秒）"
     cat <<'EOF'
 
- 候选配置说明：
-   A 保持现状                    —— 基线
-   B NCCL_P2P_DISABLE=1          —— 关 GPU 间 P2P（最可能有效：单卡不用 P2P 所以正常）
-   C NCCL_P2P_DISABLE=1 + IB 关  —— 退到共享内存/套接字
-   D NCCL_P2P_LEVEL=LOC          —— 只用同 PCIe 交换机内的 P2P
-   E NCCL_NET_PLUGIN=none        —— 不加载外部网络插件
+ 候选配置（按成功率排序）：
+   A 保持现状                     —— 基线
+   B 强制套接字（不用设备端 kernel）—— NCCL_P2P_DISABLE=1 + NCCL_IB_DISABLE=1
+                                    + NCCL_SHM_DISABLE=1  ← 最可能有效
+   C 只关共享内存                 —— 实测中若 B 无效、C 有效则说明 shm 是瓶颈
+   D 编译目标架构显式加 sm_120    —— TORCH_CUDA_ARCH_LIST=12.0（影响 JIT 编译路径）
+   E 关 P2P 单变量                —— 对照
 EOF
     local cfg_names=(
         "A_基线"
-        "B_关P2P"
-        "C_关P2P+关IB"
-        "D_P2P_LEVEL_LOC"
-        "E_无net插件"
+        "B_强制套接字"
+        "C_只关共享内存"
+        "D_ARCH_LIST_12.0"
+        "E_关P2P"
     )
     local cfg_envs=(
         ""
+        "NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 NCCL_SHM_DISABLE=1"
+        "NCCL_SHM_DISABLE=1"
+        "TORCH_CUDA_ARCH_LIST=12.0"
         "NCCL_P2P_DISABLE=1"
-        "NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1"
-        "NCCL_P2P_LEVEL=LOC"
-        "NCCL_NET_PLUGIN=none"
     )
     local worked=()
     local idx
@@ -752,14 +755,27 @@ EOF
         warn "所有配置都失败 —— 这个容器的多卡通信确实不可用"
         cat <<'EOF'
 
- 建议（按优先级）：
-   1) 换镜像：当前是 2.7.0a0+ecf3bae40a.nv25.02。改用平台【官方推荐】的
-      PyTorch 镜像，或与 GPU 架构匹配的 CUDA 版本
-   2) 查 GPU 真实型号：nvidia-smi 显示 "NVIDIA RPBZZZ6" 是【平台脱敏名】。
-      若型号较特殊，通用镜像里的 NCCL/PyTorch 可能没有该架构的 kernel ——
-      "Cuda failure 1 'invalid argument'" 正是这种典型症状
-   3) 暂时用 1 卡：1 卡已证明完全可用（L4 过拟合 500 步通过），
-      只是慢；先跑出可用权重，再解决多卡
+ 根因（已由实测数据确认）：
+   GPU 的 compute capability = sm_120（Blackwell），
+   而镜像 tag 是 25.02（2025-02），里面 NCCL 2.25.1 —— 太老，
+   没有为 sm_120 编译的设备端 kernel。于是连最基本的 4 卡 broadcast
+   都报 `Cuda failure 1 'invalid argument'`（NCCL enqueue 启动 kernel 失败）。
+   1 卡能用，是因为单卡通信不需要跨卡 kernel。
+
+ 解决办法（按推荐顺序）：
+   1) ★ 换镜像：用 NGC PyTorch 更新 tag，例如
+        nvcr.io/nvidia/pytorch:25.09-py3   或   25.10-py3
+      （NGC 文档：25.01 起容器才针对 Blackwell 优化；25.02 的 NCCL 仍偏旧）
+      ⚠️ 25.10 基于 CUDA 13，而本项目要 torch 2.7.1+cu128 —— 注意冲突。
+         用 25.09 或更早且 NCCL ≥ 2.26.2 的 tag 更稳。
+   2) 若必须用这个镜像：只能用 1 卡训练（已证明可用，但 10 epoch ≈ 11 天）
+   3) 把这份日志给平台支持，问：这批 GPU 是 sm_120，有没有针对 Blackwell
+      优化的镜像 tag
+
+ 本机实测数据（可一并提供给平台）：
+   torch=2.7.0a0+ecf3bae40a.nv25.02  cuda=12.8  nccl=(2,25,1)  ndev=4
+   GPU0 name='NVIDIA RPBZZZ6'  compute_capability=sm_120
+   4 卡 dist.broadcast 失败: NCCL enqueue.cc:1500 Cuda failure 1 'invalid argument'
 EOF
     else
         ok "以下配置可以跑通 4 卡通信："

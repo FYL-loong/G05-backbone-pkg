@@ -37,6 +37,17 @@ def main() -> int:
         _nccl_env = ", ".join(f"{k}={os.environ[k]}" for k in sorted(os.environ)
                               if k.startswith("NCCL_"))
         print(f"[nccl-min] NCCL env: {_nccl_env or '(none)'}", flush=True)
+        # ★ 关键：这个 torch 是为哪些架构编译的？sm_120(Blackwell) 不在列表里
+        #   就说明缺该架构的 kernel —— 多卡 NCCL 会报 Cuda failure 1 'invalid argument'
+        try:
+            print(f"[nccl-min] torch 编译架构列表 = {torch.cuda.get_arch_list()}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[nccl-min] 读 arch_list 失败: {e}", flush=True)
+        try:
+            print(f"[nccl-min] CUDA 可用={torch.cuda.is_available()} "
+                  f"is_nccl_available={dist.is_nccl_available()}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[nccl-min] 读 nccl 可用性失败: {e}", flush=True)
 
     try:
         dist.init_process_group(backend="nccl")
