@@ -673,6 +673,43 @@ do_smoke_ddp() {
     [[ "${n:-0}" -ge 1 ]] || n=1
     info "多卡自检，GPU 数=$n"
 
+    # ★ 关键：自检用的是【容器自带 python/torch】，而正式训练用的是【.venv 的 torch】。
+    #   两者的 NCCL 可能不是同一个（venv 由 uv.lock 决定 nvidia-nccl-cu12 的版本）。
+    #   只测一个会出现"自检通过、正式训练仍崩"的假阴性，所以两个都报告。
+    if [[ -x .venv/bin/python ]]; then
+        echo
+        info "【venv 的 torch/NCCL】—— 这才是正式训练真正使用的："
+        .venv/bin/python - <<'PYV' || true
+import glob, os, site
+try:
+    import torch
+    print(f"    venv torch={torch.__version__} cuda={torch.version.cuda} "
+          f"nccl={torch.cuda.nccl.version()}")
+    print(f"    venv arch_list={torch.cuda.get_arch_list()}")
+except Exception as e:
+    print(f"    venv torch 读取失败: {type(e).__name__}: {e}")
+try:
+    import torch as _t
+    roots = [os.path.dirname(os.path.dirname(_t.__file__))]
+    try:
+        roots += list(site.getsitepackages())
+    except Exception:
+        pass
+    found = []
+    for r in dict.fromkeys(roots):
+        found += glob.glob(os.path.join(r, "**", "libnccl.so*"), recursive=True)
+    for f in found[:4]:
+        print(f"    venv libnccl: {f}")
+    if not found:
+        print("    venv libnccl: 未找到（可能静态链接进 torch）")
+except Exception as e:
+    print(f"    venv libnccl 查找失败: {e}")
+PYV
+    else
+        warn "没有 .venv —— 只能测容器自带的 torch；正式训练的 torch 版本可能不同"
+    fi
+    echo
+
     if [[ ! -f tools/ddp_smoke_test.py ]]; then
         fail "缺少 tools/ddp_smoke_test.py"
     fi
