@@ -107,6 +107,70 @@ run_sync "方式1：常规 uv sync" \
 
 [[ "$SYNC_OK" == "1" ]] || fail "uv sync 未成功"
 
+# ---------------------------------------------------------------- 4.5 NCCL 升级（可选）
+# 为什么需要：实测 GPU 是 sm_120（Blackwell 入门专业卡，96GB），而 uv.lock 锁的
+#   nvidia-nccl-cu12 == 2.26.2（2025-02）【不认识 sm_120】→ 4 卡连最基本的
+#   broadcast 都报 `NCCL enqueue.cc Cuda failure 1 'invalid argument'`。
+#   （1 卡可用，因为单卡不需要跨卡 kernel。）
+#
+# ⚠️ 关键认识：.venv 是【独立用 uv 装的】，它的 torch/NCCL 不来自容器镜像 ——
+#    所以要改的是 venv 里的 NCCL，而不是换镜像。
+#
+# 做法：uv sync 完成后，直接在 venv 里 pip 升级 nvidia-nccl-cu12。
+#   ★ 不动 pyproject.toml、不动 uv.lock、不动 torch —— 零配置风险
+#     （曾尝试给 pyproject 注入 [tool.uv] override-dependencies，但注入后
+#       TOML 校验失败；而且 pyproject.toml 里原本就有一句注释警告过
+#       "故意不写进 [tool.uv]，避免万一键名不被支持导致 manifest 直接无效"。）
+#   装错了也不怕：uv sync 会按 lock 纠正回来。
+#
+# 开关：G05_NCCL_UPGRADE=1（默认）| 0 关闭；G05_NCCL_VER 指定版本。
+NCCL_VER="${G05_NCCL_VER:-2.29.7}"
+if [[ "${G05_NCCL_UPGRADE:-1}" == "1" ]]; then
+    VENV_PY_PRE="$PROJECT_ROOT/.venv/bin/python"
+    info "把 venv 里的 nvidia-nccl-cu12 升级到 $NCCL_VER（支持 sm_120；不动 torch）"
+    if "$VENV_PY_PRE" -m pip install --quiet --no-deps \
+            "nvidia-nccl-cu12==$NCCL_VER" 2>&1 | tail -5; then
+        ok_sync "nvidia-nccl-cu12==$NCCL_VER（pip 直装）"
+    else
+        warn "升级 nvidia-nccl-cu12 失败（不阻塞）—— 若 4 卡 NCCL 报错请看这里"
+    fi
+    # 立刻验证：torch 报告的是哪个 NCCL？libnccl.so 来自哪里？
+    "$VENV_PY_PRE" - <<'PYNCCL' || true
+import glob, os, site
+try:
+    import torch
+    print(f"[nccl] torch={torch.__version__}  torch 报告 nccl={torch.cuda.nccl.version()}")
+except Exception as e:
+    print(f"[nccl] 读 torch 失败: {type(e).__name__}: {e}")
+try:
+    import torch as _t
+    td = os.path.dirname(_t.__file__)
+    a = glob.glob(os.path.join(td, "lib", "libnccl.so*"))
+    b = []
+    dirs = [os.path.dirname(td)]
+    try:
+        dirs += list(site.getsitepackages())
+    except Exception:
+        pass
+    for r in dict.fromkeys(dirs):
+        b += glob.glob(os.path.join(r, "**", "nvidia", "nccl", "**", "libnccl.so*"),
+                       recursive=True)
+    b = sorted(dict.fromkeys(b))
+    print(f"[nccl] [A] torch 自带 torch/lib/: {a or '无'}")
+    print(f"[nccl] [B] pip 包 nvidia/nccl/:  {b or '无'}")
+    if b and not a:
+        print("[nccl] -> ★ 用 pip 包，升级【会生效】")
+    elif a:
+        print("[nccl] -> ★ 用 torch 自带，升级【不会生效】，需要换 torch 或镜像")
+    else:
+        print("[nccl] -> 都没找到（可能静态链接）")
+except Exception as e:
+    print(f"[nccl] 查找 libnccl 失败: {e}")
+PYNCCL
+else
+    info "G05_NCCL_UPGRADE=0 —— 不改 NCCL（sm_120 上 4 卡会失败）"
+fi
+
 # ---------------------------------------------------------------- 5. 验证
 info "验证环境 ..."
 VENV_PY="$PROJECT_ROOT/.venv/bin/python"
