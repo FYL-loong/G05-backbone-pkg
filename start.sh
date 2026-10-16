@@ -681,6 +681,28 @@ do_smoke_ddp() {
         if [[ -n "${!v:-}" ]]; then printf '       %-18s = %s\n' "$v" "${!v}"; fi
     done
     echo
+
+    # ★ 关键交叉验证：平台注入的 NCCL_IB_HCA / NCCL_SOCKET_IFNAME 指向的设备，
+    #   在【容器内】真的存在吗？百舸按宿主机拓扑注入这些变量，但容器里看到的
+    #   设备/IP 可能与宿主机不同 —— 对不上就会让 NCCL 的 IB 传输初始化失败。
+    info "容器内【真实存在】的网络/RDMA 设备（与上面注入的值对比）:"
+    if command -v ibv_devices >/dev/null 2>&1; then
+        echo "       --- ibv_devices（RDMA 设备名）---"
+        ibv_devices 2>&1 | sed 's/^/       /' || true
+    else
+        echo "       ibv_devices: 命令不存在（未装 OFED 用户态工具）"
+    fi
+    if [[ -d /sys/class/infiniband ]]; then
+        echo "       --- /sys/class/infiniband（RDMA 设备）---"
+        ls -1 /sys/class/infiniband 2>/dev/null | sed 's/^/       /' || true
+    else
+        echo "       /sys/class/infiniband: 不存在（容器内看不到 RDMA 设备）"
+    fi
+    echo "       --- IP 接口（NCCL_SOCKET_IFNAME 应指向其中之一）---"
+    (ip -o -4 addr show 2>/dev/null || ifconfig -a 2>/dev/null) | sed 's/^/       /' || true
+    echo "       --- /dev/infiniband（RDMA 字符设备）---"
+    ls -1 /dev/infiniband 2>/dev/null | sed 's/^/       /' || echo "       /dev/infiniband: 不存在"
+    echo
     # ★ GPU 拓扑：确认是否存在 P2P。
     #   Blackwell 入门专业卡/消费卡（含 RTX PRO 6000 / RTX 50 系）在普通 PCIe 上
     #   通常【没有可用的 P2P、也没有 NVLink】。
@@ -771,28 +793,42 @@ EOF
     fi
 
     # ---- 失败：自动尝试一组 NCCL 配置，找出哪种能跑通 --------------------
-    # 实测：GPU 是 sm_120（Blackwell），镜像 25.02 里 NCCL 2.25.1 —— 太老，
-    # 没有为 sm_120 编译的设备端 kernel，所以连最基本的 broadcast 都报
+    # 实测：GPU 是 sm_120（Blackwell 入门专业卡），容器 NCCL 2.25.1 / venv 2.26.2
+    # —— 都早于 sm_120 支持，连最基本的 broadcast 都报
     #     Cuda failure 1 'invalid argument'（enqueue.cc:1500，kernel 启动失败）
     # 而 1 卡正常（单卡不需要跨卡 kernel）。
-    # 下面按"最可能有效"排序：先试【完全绕开设备端 kernel】的套接字路径。
+    #
+    # ★ 另外：百舸【按宿主机拓扑】注入了 RDMA 变量（NCCL_IB_HCA / NCCL_IB_GID_INDEX
+    #   / NCCL_SOCKET_IFNAME / NCCL_IB_ADAPTIVE_ROUTING）。若这些值在【容器内】
+    #   对不上真实设备，NCCL 的 IB 传输初始化就会失败 —— 所以专门有一组把它们清掉。
     warn "多卡自检失败 rc=$rc —— 自动尝试以下 NCCL 配置（每个约 15 秒）"
     cat <<'EOF'
 
  候选配置（按成功率排序）：
-   A 保持现状                     —— 基线
-   B 强制套接字（不用设备端 kernel）—— NCCL_P2P_DISABLE=1 + NCCL_IB_DISABLE=1
-                                    + NCCL_SHM_DISABLE=1  ← 最可能有效
-   C 只关共享内存                 —— 实测中若 B 无效、C 有效则说明 shm 是瓶颈
-   D 编译目标架构显式加 sm_120    —— TORCH_CUDA_ARCH_LIST=12.0（影响 JIT 编译路径）
-   E 关 P2P 单变量                —— 对照
+   A 基线                             —— 保留平台注入的一切
+   B 清掉平台注入的 RDMA 变量          —— 最可能有效：容器内设备若与宿主机
+                                        注入的 NCCL_IB_HCA/GID_INDEX 对不上，
+                                        清掉后 NCCL 退回套接字/共享内存
+   C P2P 关闭 + 清 RDMA 变量           —— 无 P2P 的 Blackwell 卡（社区文档推荐
+                                        NCCL_P2P_DISABLE=1，配合 NCCL≥2.27）
+   D 强制纯套接字                       —— 完全不用设备端 kernel
+   E 关共享内存                         —— 区分 shm 是否瓶颈
 EOF
     local cfg_names=(
         "A_基线"
-        "B_强制套接字"
-        "C_只关共享内存"
-        "D_ARCH_LIST_12.0"
-        "E_关P2P"
+        "B_清RDMA变量"
+        "C_关P2P+清RDMA"
+        "D_纯套接字"
+        "E_关共享内存"
+    )
+    # 清掉环境变量的写法：用 env -u 逐个 unset
+    local CLEAR_RDMA="env -u NCCL_IB_HCA -u NCCL_IB_GID_INDEX -u NCCL_IB_ADAPTIVE_ROUTING -u NCCL_TOPO_FILE"
+    local cfg_cmds=(
+        "env"
+        "$CLEAR_RDMA"
+        "$CLEAR_RDMA NCCL_P2P_DISABLE=1"
+        "env NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 NCCL_SHM_DISABLE=1"
+        "env NCCL_SHM_DISABLE=1"
     )
     local cfg_envs=(
         ""
@@ -805,12 +841,12 @@ EOF
     local idx
     for idx in "${!cfg_names[@]}"; do
         local nm="${cfg_names[$idx]}"
-        local ev="${cfg_envs[$idx]}"
+        local cmd="${cfg_cmds[$idx]}"
         echo
-        info "---- 尝试 [$nm]  env: ${ev:-<无追加>} ----"
+        info "---- 尝试 [$nm]  命令前缀: $cmd ----"
         set +e
         # shellcheck disable=SC2086
-        env $ev "$PY" -m torch.distributed.run \
+        $cmd "$PY" -m torch.distributed.run \
             --standalone --nnodes 1 --nproc-per-node "$n" \
             tools/nccl_minimal_test.py 2>&1 | \
             grep -E 'nccl-min|Cuda failure|Unhandled|ncclUnhandled' | head -20
@@ -818,7 +854,7 @@ EOF
         set -e
         if [[ $rc2 -eq 0 ]]; then
             ok "[$nm] ✅ 通过"
-            worked+=("$nm => $ev")
+            worked+=("$nm => $cmd")
         else
             warn "[$nm] ❌ 失败 rc=$rc2"
         fi
