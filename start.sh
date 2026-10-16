@@ -13,7 +13,7 @@
 # 平台「执行命令」框 —— 复制这段，只改 HF_TOKEN：
 #
 #   set -e
-#   export HF_TOKEN="hf_把你的真实token填这里"     # ★ 唯一必需；留空会立刻失败
+#   export HF_TOKEN="hf_把你的真实token填这里"     # setup/train/all 必需；smoke 不需要
 #   export G05_VIDEO_BACKEND=pyav                 # 可选（省掉自动探测；不写也能跑）
 #   git clone https://github.com/FYL-loong/G05-backbone-pkg.git G05-backbone-pkg
 #   cd G05-backbone-pkg
@@ -31,7 +31,8 @@
 #   MODE=all     bash start.sh    默认，全自动
 #
 # 环境变量：
-#   HF_TOKEN          必需。HF 读写 token（写在平台执行命令里，勿提交到 git）
+#   HF_TOKEN          setup / train / all 必需（下载权重、上传结果）；
+#                     smoke / smoke-ddp 不需要（它们不下载任何东西）
 #   G05_OUTPUT_DIR    可选，默认 /workspace/output
 #   GPUS              可选，训练卡数；默认取 NPROC_PER_NODE / MLP_WORKER_GPU /
 #                     MLP_WORKER_NUM / nvidia-smi 探测
@@ -180,17 +181,30 @@ retry() {
 
 EXP_DIR_FOUND=""
 
+# 需要 HF_TOKEN 的阶段才调用它。⚠️ 不要放在全局前置检查里 ——
+# smoke / smoke-ddp 不下载任何东西，不该被 token 卡住（曾经因此白跑一次任务）。
+require_hf_token() {
+    [[ -n "${HF_TOKEN:-}" ]] || fail "未设置 HF_TOKEN。请把它写在平台任务的执行命令里：export HF_TOKEN=\"hf_...\""
+    export HF_TOKEN
+}
+
 # ---------------------------------------------------------------- 前置检查
 step "0. 前置检查"
-
-[[ -n "${HF_TOKEN:-}" ]] || fail "未设置 HF_TOKEN。请把它写在平台任务的执行命令里：export HF_TOKEN=\"hf_...\""
-export HF_TOKEN
 
 info "MODE           = $MODE"
 info "PROJECT_ROOT   = $PROJECT_ROOT"
 info "G05_OUTPUT_DIR = $G05_OUTPUT_DIR"
 info "HF_ENDPOINT    = $HF_ENDPOINT"
 info "ONLY_TASK      = ${ONLY_TASK:-<全部 10 个任务>}"
+if [[ -z "${HF_TOKEN:-}" ]]; then
+    if [[ "$MODE" == "smoke" || "$MODE" == "smoke-ddp" ]]; then
+        info "HF_TOKEN       = <未设置，本 MODE 不需要>"
+    else
+        warn "HF_TOKEN       = <未设置> —— 需要下载/上传的阶段会失败"
+    fi
+else
+    info "HF_TOKEN       = <已设置，${#HF_TOKEN} 字符>"
+fi
 
 # ---- 包完整性门禁 ----
 # 便宜（几秒）且抓到过真 bug：.gitignore 写了裸目录名 `eval/`，把官方源码目录
@@ -261,6 +275,7 @@ df -h "$G05_OUTPUT_DIR" | tail -1 | sed 's/^/       /'
 # setup：装环境 + 拉权重 + 拉数据 + 自检
 # ============================================================================
 do_setup() {
+    require_hf_token        # 下载权重/数据需要 HF 读权限
     step "1. 安装环境（uv sync，首次约 10-30 分钟）"
     # NGC 镜像自带 Python 3.12，但项目要求 3.10.16（.python-version / requires-python），
     # 所以 uv 必须联网下载独立 Python 3.10 —— 源默认是 GitHub Releases，国内不可靠。
@@ -397,6 +412,7 @@ do_verify() {
 # train：正式训练 + 守护上传 + 等待结束 + 收尾上传权重
 # ============================================================================
 do_train() {
+    require_hf_token        # 权重/checkpoint 要上传到 HF
     activate_venv
 
     local n="${GPUS:-${NPROC_PER_NODE:-${MLP_WORKER_GPU:-${MLP_WORKER_NUM:-$(nvidia-smi -L 2>/dev/null | wc -l | tr -d ' ')}}}}"
