@@ -966,8 +966,38 @@ def finetune(cfg: DictConfig):
     #   - 945 个全过   -> 问题不在 broadcast，而在 DDP 内部别处
     # 代价：每个参数一次同步，几分钟；只在排错时开。
     if os.environ.get("G05_DEBUG_DDP_BCAST", "0") == "1" and dist.is_initialized():
+        # (a) 先做一遍【等价于 DDP 内部】的分组 broadcast：按 dtype 分组、打包成桶。
+        #     DDP 的 dist._broadcast_coalesced 就是"按 dtype 分组 + flatten 进桶"。
+        #     如果【分组版炸、逐个版不炸】→ 直接指向 bucketing/flatten 环节。
+        #     这个很快（桶数不多），应该几秒。
+        logger.info("[bcast probe] (a) 分组 broadcast（模仿 DDP 的 _broadcast_coalesced）...")
+        _t0 = __import__("time").time()
+        _groups = {}
+        for _n, _p in model.named_parameters():
+            _groups.setdefault((str(_p.dtype), str(_p.device)), []).append((_n, _p))
+        for _k, _items in _groups.items():
+            logger.info(f"[bcast probe]   组 {_k}: {len(_items)} 个参数, "
+                        f"总元素 {sum(p.numel() for _, p in _items):,}")
+            _flat = [p.data.reshape(-1) for _, p in _items]
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            try:
+                dist._broadcast_coalesced(dist.group.WORLD, _flat, 128, 0)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                logger.info(f"[bcast probe]   ✅ 组 {_k} broadcast 成功")
+            except Exception as _e:  # noqa: BLE001
+                logger.error(f"[bcast probe]   ★★★ 组 {_k} broadcast 失败: "
+                             f"{type(_e).__name__}: {_e}")
+                _bad = [(n, tuple(p.shape), p.data_ptr(), p.stride())
+                        for n, p in _items[:20]]
+                logger.error(f"[bcast probe]   前 20 个参数 (name, shape, ptr, stride): {_bad}")
+                break
+        logger.info(f"[bcast probe] (a) 耗时 {__import__('time').time()-_t0:.1f}s")
+
+        # (b) 再逐个 broadcast（慢，但能指认到具体参数名）
         _n_total = sum(1 for _ in model.parameters())
-        logger.info(f"[bcast probe] 逐个 broadcast {_n_total} 个参数 ...")
+        logger.info(f"[bcast probe] (b) 逐个 broadcast {_n_total} 个参数 ...")
         _i = 0
         _hit = None
         for _name, _p in model.named_parameters():
