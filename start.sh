@@ -77,6 +77,10 @@ export PYTHONWARNINGS="${PYTHONWARNINGS:-ignore}"
 
 # G05_DEBUG_DDP=1：在 DDP 构造前打印所有 param/buffer 的 设备/dtype/连续性
 export G05_DEBUG_DDP="${G05_DEBUG_DDP:-0}"
+# G05_GRAD_BUCKET_VIEW=1：开启 DDP 的零拷贝梯度桶优化（默认 0 = 关闭，稳定优先）
+#   实测 4 卡在 DDP 建好后、第一个 step 前报 illegal memory access，1 卡正常。
+#   该优化在"共享参数(weight tying) + 混合 dtype"下容易构造错误的桶 view。
+export G05_GRAD_BUCKET_VIEW="${G05_GRAD_BUCKET_VIEW:-0}"
 
 # ------------------------------------------------- 视觉注意力后端（重要）
 # flash-attn-4 是 CuTe DSL 实现：**import 成功不代表能用** —— forward 时才现场编译

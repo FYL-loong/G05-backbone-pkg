@@ -881,20 +881,37 @@ def finetune(cfg: DictConfig):
         max_steps = cfg.model.max_steps
 
     # ---- DDP wrapping ----
-    # 诊断（G05_DEBUG_DDP=1 时打印）：DDP 构造会 broadcast 所有 param/buffer 并分配
-    # 梯度桶。实测 4 卡在【DDP 构造函数内部】报 "CUDA error: an illegal memory
-    # access"，而 1 卡（L4 过拟合 500 步）正常 —— 单卡不做跨 rank broadcast，掩盖了
-    # 问题。所以这里先列出设备/dtype/连续性，一眼看出有没有"混进去的异类张量"。
+    # 诊断（G05_DEBUG_DDP=1 时打印）。
+    # 背景：4 卡正式训练在 `DDP(...)` 调用【之后、第一个 step 之前】报
+    #   NCCL WARN enqueue.cc:1556 Cuda failure 700 'an illegal memory access'
+    # 而 1 卡（L4 过拟合 500 步）完全正常 —— 单卡不建 NCCL 通信域、不 broadcast，
+    # 掩盖了问题。参数设备/dtype 已被证明干净，所以这里额外检查三件容易出事的事：
+    #   1) 重复/共享参数（resize_embedding 的 weight tying 会让同一个 Parameter
+    #      被两处引用 —— DDP 的桶分配对重复参数很敏感）
+    #   2) 非连续张量（NCCL 对 stride 有要求）
+    #   3) 零元素张量
     if os.environ.get("G05_DEBUG_DDP", "0") == "1":
         _bad = []
+        _seen = {}
+        _dups = []
         for _n, _p in model.named_parameters():
-            if _p.device.index != device_id or _p.dtype not in (torch.float32, torch.bfloat16):
-                _bad.append(f"PARAM {_n}: device={_p.device} dtype={_p.dtype} "
-                            f"contig={_p.is_contiguous()} shape={tuple(_p.shape)}")
+            _key = _p.data_ptr()
+            if _key in _seen:
+                _dups.append(f"{_seen[_key]} <-> {_n} (data_ptr={_key})")
+            else:
+                _seen[_key] = _n
+            if _p.device.index != device_id:
+                _bad.append(f"PARAM {_n}: device={_p.device} dtype={_p.dtype}")
+            if not _p.is_contiguous():
+                _bad.append(f"PARAM {_n}: 非连续 (stride={_p.stride()})")
+            if _p.numel() == 0:
+                _bad.append(f"PARAM {_n}: 零元素 shape={tuple(_p.shape)}")
+        _bbad = []
         for _n, _b in model.named_buffers():
             if _b.device.index != device_id:
-                _bad.append(f"BUFFER {_n}: device={_b.device} dtype={_b.dtype} "
-                            f"shape={tuple(_b.shape)}")
+                _bad.append(f"BUFFER {_n}: device={_b.device} dtype={_b.dtype}")
+            if not _b.is_contiguous():
+                _bbad.append(f"BUFFER {_n}: 非连续 (stride={_b.stride()})")
         _dtypes = {}
         for _n, _p in model.named_parameters():
             _dtypes[str(_p.dtype)] = _dtypes.get(str(_p.dtype), 0) + 1
@@ -902,7 +919,14 @@ def finetune(cfg: DictConfig):
             f"[DDP debug] device_id={device_id} 参数量={sum(1 for _ in model.parameters())} "
             f"dtype 分布={_dtypes} buffer 数={sum(1 for _ in model.buffers())}"
         )
-        # 非 float32/bf16 的参数（如整数 embedding、量化张量）在 DDP broadcast 时易出问题
+        if _dups:
+            logger.warning(
+                f"[DDP debug] ★ 发现 {len(_dups)} 组【共享/重复参数】（weight tying）："
+            )
+            for _d in _dups[:10]:
+                logger.warning(f"[DDP debug]    {_d}")
+        else:
+            logger.info("[DDP debug] 没有共享/重复参数")
         _nonfloat = [f"{n}:{p.dtype}" for n, p in model.named_parameters()
                      if not p.is_floating_point()]
         if _nonfloat:
@@ -912,17 +936,36 @@ def finetune(cfg: DictConfig):
             for _l in _bad[:30]:
                 logger.warning(f"[DDP debug] 异常张量 -> {_l}")
         else:
-            logger.info("[DDP debug] 所有 param/buffer 设备一致、param 均为 fp32/bf16")
+            logger.info("[DDP debug] param/buffer 设备一致、均连续、无零元素")
+        if _bbad:
+            logger.warning(f"[DDP debug] 非连续 buffer {len(_bbad)} 个: {_bbad[:5]}")
 
-    logger.info("Wrapping model with DDP...")
+    # gradient_as_bucket_view 是一个【零拷贝优化】：让每个参数的 .grad 直接指向
+    # DDP 梯度桶里的一个 view，省掉一次拷贝。
+    #
+    # ⚠️ 实测踩过：4 卡正式训练在 DDP 建好、第一个 step 之前就报
+    #       NCCL WARN enqueue.cc:1556 Cuda failure 700 'an illegal memory access'
+    #    而 1 卡（L4 过拟合 500 步）完全正常 —— 单卡不建 NCCL 通信域、不分配梯度桶。
+    #    该优化在【共享参数(weight tying) + 混合 dtype】的模型上容易构造出错误的
+    #    桶 view，表现就是越界访问。
+    #    因此默认关闭（省一次拷贝远不如训练能跑起来重要）。
+    #    想验证或追求性能：G05_GRAD_BUCKET_VIEW=1 打开。
+    _bucket_view = os.environ.get("G05_GRAD_BUCKET_VIEW", "0") == "1"
+    logger.info(
+        f"Wrapping model with DDP... (gradient_as_bucket_view={_bucket_view}"
+        f"{'，零拷贝优化；若出现 illegal memory access 请置 0' if _bucket_view else '，稳定优先'})"
+    )
     model = DDP(
         model,
         device_ids=[device_id],
         find_unused_parameters=cfg.model.find_unused_parameters,
-        gradient_as_bucket_view=True,
+        gradient_as_bucket_view=_bucket_view,
         bucket_cap_mb=128,
     )
     logger.info("DDP wrapping done.")
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        logger.info("[DDP debug] DDP 构造后 cuda.synchronize() 通过（无异步 CUDA 错误）")
 
     # Create Optimizer
     logger.info("Creating optimizer and LR scheduler...")
