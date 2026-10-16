@@ -150,22 +150,37 @@ else
     warn "没有 check_package.py，跳过包完整性检查"
 fi
 
-# ---- 配置自检（只在 .venv 已就绪时跑；否则 setup 装完环境再跑）----
-# 这一层专抓"配置/参数级"错误，几秒出结果。曾经踩过：
-#   `Cannot set both max_epochs and max_steps`（task=yam 把 max_epochs 覆盖成 10，
-#   又与命令行 max_steps 冲突）—— 该断言在 finetune.py:877，**发生在任何下载之前**，
-#   却被 12 分钟的下载埋到第 17 分钟才暴露。现在提前到几秒。
+# ---- 配置自检（专抓"配置/参数级"错误，几秒出结果）----
+# 曾经踩过：`Cannot set both max_epochs and max_steps`（task=yam 把 max_epochs
+# 覆盖成 10，又与命令行 max_steps 冲突）—— 该断言在 finetune.py:877，
+# **发生在任何下载之前**，却被 12 分钟的下载埋到第 17 分钟才暴露。
+#
+# ⚠️ 它需要 hydra/omegaconf，而这两者只在 .venv 里 —— 所以：
+#    - setup 之前（容器刚起）：跳过，不报错
+#    - setup 之后：**必跑**（这才是真正能拦住问题的地方）
+# 返回 0=通过（或跳过），非 0=配置有问题（致命）
 config_check_now() {
-    [[ -x .venv/bin/python ]] || return 0
     [[ -f config_check.py ]] || return 0
+    if [[ ! -x .venv/bin/python ]]; then
+        info "尚无 .venv，跳过配置自检（setup 之后会自动跑）"
+        return 0
+    fi
+    if .venv/bin/python -c "import hydra, omegaconf" 2>/dev/null; then
+        :
+    else
+        warn ".venv 里没有 hydra/omegaconf，跳过配置自检"
+        return 0
+    fi
     info "配置自检（几秒，不需要 GPU/权重/数据）..."
     if .venv/bin/python config_check.py "$@" ; then
         ok "配置自检通过"
-    else
-        fail "配置自检失败 —— 见上方原因（这是【配置/传参】问题，不必下载权重）"
+        return 0
     fi
+    return 1
 }
-config_check_now
+# 注意：这里【只告警不退出】—— 如果 .venv 还没建（容器刚起），它在 setup
+# 完成后还会再跑一次；在 setup 之后调用时才是致命检查。
+config_check_now || warn "配置自检未通过（若此时尚无 .venv 属正常，setup 后会再验一次）"
 
 if nvidia-smi >/dev/null 2>&1; then
     info "GPU:"
@@ -205,6 +220,13 @@ do_setup() {
     fi
     activate_venv
     python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'avail', torch.cuda.is_available())"
+
+    # ★ 配置自检放在这里：环境已就绪、但【还没下载 11.5GB 权重 + 20GB 数据】。
+    #   这是能拦住"配置级"错误的最早时机。失败即致命，不再往下走。
+    step "1.5 配置自检（几秒；在下载权重/数据【之前】拦下配置错误）"
+    if ! config_check_now; then
+        fail "配置自检失败 —— 见上方原因。这是【配置/传参】问题，不必下载权重。"
+    fi
 
     step "2. 下载权重（约 11.5GB，失败自动重试 3 次）"
     retry 3 60 bash download_weights.sh
@@ -452,18 +474,32 @@ do_smoke() {
     python check_package.py . && ok "包完整性通过" || fail "包完整性失败（代码缺文件）"
 
     step "smoke 2/3 配置自检（hydra 组装 + validate + 互斥检查）"
-    # 三条路径都验：默认、L2 的 --test、L4 的 --overfit
-    "$PY" config_check.py task=yam \
-        && ok "配置自检通过（task=yam 默认路径）" \
-        || fail "配置自检失败（task=yam）"
-    "$PY" config_check.py --test-mode \
-        model.pretrained_ckpt=null model.max_steps=10 model.max_epochs=null \
-        && ok "配置自检通过（L2 --test 路径）" \
-        || fail "配置自检失败（L2 --test 路径）"
-    "$PY" config_check.py --overfit \
-        model.max_steps=500 model.max_epochs=null \
-        && ok "配置自检通过（L4 --overfit 路径）" \
-        || fail "配置自检失败（L4 --overfit 路径）"
+    # 这一步需要 hydra/omegaconf/g05，只在 .venv 里 —— 没有时明确跳过并说明，
+    # 而不是抛一个看不懂的 ModuleNotFoundError。
+    if [[ ! -x .venv/bin/python ]]; then
+        warn "没有 .venv —— 配置自检【无法运行】（需要 hydra/omegaconf/g05）"
+        warn "它会在【装完环境后、下载权重前】自动跑（start.sh 的 1.5 阶段）"
+        warn "想现在就验配置：加环境变量 SMOKE_AUTO_SETUP=1，或先跑 MODE=setup"
+        if [[ "${SMOKE_AUTO_SETUP:-0}" == "1" ]]; then
+            info "SMOKE_AUTO_SETUP=1 —— 先跑 setup 装环境（约 4-6 分钟），再验配置"
+            do_setup
+        fi
+    fi
+    if [[ -x .venv/bin/python ]] && .venv/bin/python -c "import hydra, omegaconf" 2>/dev/null; then
+        PY=".venv/bin/python"
+        # 三条路径都验：默认、L2 的 --test、L4 的 --overfit
+        "$PY" config_check.py task=yam \
+            && ok "配置自检通过（task=yam 默认路径）" \
+            || fail "配置自检失败（task=yam）"
+        "$PY" config_check.py --test-mode \
+            model.pretrained_ckpt=null model.max_steps=10 model.max_epochs=null \
+            && ok "配置自检通过（L2 --test 路径）" \
+            || fail "配置自检失败（L2 --test 路径）"
+        "$PY" config_check.py --overfit \
+            model.max_steps=500 model.max_epochs=null \
+            && ok "配置自检通过（L4 --overfit 路径）" \
+            || fail "配置自检失败（L4 --overfit 路径）"
+    fi
 
     step "smoke 3/3 视频解码后端（真实解码一个样本；不需要数据集）"
     "$PY" - <<'PY'

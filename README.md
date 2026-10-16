@@ -193,19 +193,33 @@ MODE=smoke bash start.sh      # 约 1 分钟，不下载权重/数据，不跑�
 
 它检查三件事：
 
-| # | 检查 | 能抓到的坑 |
-|---|---|---|
-| 1 | **包完整性**（155 条 `g05.*` import 是否可解析） | 抽包漏文件、`.gitignore` 误吞源码目录 |
-| 2 | **配置自检**（Hydra 组装 → `validate_train_config` → `max_epochs`/`max_steps` 互斥） | override key 拼错、参数冲突、缺数据目录。**默认 / L2 `--test` / L4 `--overfit` 三条路径都验** |
-| 3 | **视频解码**（真造一个小 MP4，用代码里同一套判据决定后端） | `torchcodec` 缺系统 FFmpeg 共享库（会回退 `pyav`） |
+| # | 检查 | 能抓到的坑 | 是否需要 `.venv` |
+|---|---|---|---|
+| 1 | **包完整性**（155 条 `g05.*` import 是否可解析） | 抽包漏文件、`.gitignore` 误吞源码目录 | ❌ 不需要 |
+| 2 | **配置自检**（Hydra 组装 → `validate_train_config` → `max_epochs`/`max_steps` 互斥） | override key 拼错、参数冲突、缺数据目录。**默认 / L2 `--test` / L4 `--overfit` 三条路径都验** | ✅ **需要** |
+| 3 | **视频解码**（真造一个小 MP4，用代码里同一套判据决定后端） | `torchcodec` 缺系统 FFmpeg 共享库（会回退 `pyav`） | ❌ 不需要（镜像自带 torch） |
 
-`MODE=smoke` 不需要 `.venv`（有就用、没有就用镜像自带的 python），所以**装环境之前也能跑**。
+> ⚠️ **第 2 项需要 `hydra`/`omegaconf`/`g05`，这些只在 `.venv` 里。**
+> 容器刚起来时没有 `.venv`，smoke 会**明确跳过并提示**（不是失败）。
+> 要现在就验配置：`SMOKE_AUTO_SETUP=1 MODE=smoke bash start.sh`（会先装环境，4-6 分钟）。
+
+**但更重要的一点**：`MODE=all` 里配置自检**已经自动插在正确位置** ——
+
+```
+1.   安装环境（uv sync）        ~4 min
+1.5  配置自检 ★                ~10 s   ← 环境已就绪、但还没下载
+2.   下载权重（11.44GB）        ~6 min
+3.   下载数据集（~20GB）        ~2 min
+```
+
+**所以正式任务不会再"下载 12 分钟才发现配置写错"。** 这是修 bug #5（`Cannot set both
+max_epochs and max_steps`）暴露太晚的根本解法。
 
 **没验的**（只能靠真实运行，但已收在一次任务里）：
 11.44GB 权重完整加载（L3）、flash-attn/CuTe kernel 编译（已默认绕开走 SDPA）、
 显存是否够、DDP 是否正常。
 
-单独跑配置自检也可以（进了容器后在项目目录下）：
+单独跑配置自检也可以（在装了环境的容器里）：
 
 ```bash
 source .venv/bin/activate
