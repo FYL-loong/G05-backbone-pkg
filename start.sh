@@ -830,13 +830,6 @@ EOF
         "env NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 NCCL_SHM_DISABLE=1"
         "env NCCL_SHM_DISABLE=1"
     )
-    local cfg_envs=(
-        ""
-        "NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 NCCL_SHM_DISABLE=1"
-        "NCCL_SHM_DISABLE=1"
-        "TORCH_CUDA_ARCH_LIST=12.0"
-        "NCCL_P2P_DISABLE=1"
-    )
     local worked=()
     local idx
     for idx in "${!cfg_names[@]}"; do
