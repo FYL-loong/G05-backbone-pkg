@@ -43,6 +43,9 @@
 #   AUTO_UPLOAD       默认 1；=0 关闭 checkpoint 守护上传
 #   UPLOAD_INTERVAL   守护上传轮询秒数，默认 600
 #   KEEPALIVE         可选，收尾后挂起 N 秒再退出（便于进容器查看）
+#   G05_DEBUG_CUDA    可选，=1 打开 CUDA_LAUNCH_BLOCKING + TORCH_USE_CUDA_DSA
+#                     （定位 CUDA illegal memory access；会显著变慢）
+#   G05_DEBUG_DDP     可选，=1 在 DDP 构造前打印 param/buffer 的设备/dtype
 # ============================================================================
 set -euo pipefail
 # 故意不用 pipefail：`cmd | head -1` 这类写法里，下游 head 读够就退出，上游
@@ -71,6 +74,22 @@ export TQDM_MININTERVAL="${TQDM_MININTERVAL:-10}"
 export TQDM_MINITERS="${TQDM_MINITERS:-50}"
 # 关掉 Python 的 DeprecationWarning / FutureWarning 刷屏
 export PYTHONWARNINGS="${PYTHONWARNINGS:-ignore}"
+
+# ------------------------------------------------- CUDA 调试开关（按需打开）
+# G05_DEBUG_CUDA=1 打开后：
+#   CUDA_LAUNCH_BLOCKING=1  —— 让 CUDA 调用同步执行，"illegal memory access"
+#                              会停在真正犯错的那个 kernel 上（默认是异步报的，
+#                              栈会指向无关 API）。慢很多，只在排错时开。
+#   TORCH_USE_CUDA_DSA=1    —— 打开 device-side assert，能指出越界的下标。
+# 实测踩过：4 卡正式训练在【DDP 构造函数内部】报 illegal memory access，
+# 而 1 卡（L4 过拟合）正常，没有 Python traceback，只能靠它定位。
+if [[ "${G05_DEBUG_CUDA:-0}" == "1" ]]; then
+    export CUDA_LAUNCH_BLOCKING=1
+    export TORCH_USE_CUDA_DSA=1
+    warn "G05_DEBUG_CUDA=1 —— 已开 CUDA_LAUNCH_BLOCKING + TORCH_USE_CUDA_DSA（会变慢）"
+fi
+# G05_DEBUG_DDP=1：在 DDP 构造前打印所有 param/buffer 的 设备/dtype/连续性
+export G05_DEBUG_DDP="${G05_DEBUG_DDP:-0}"
 
 # ------------------------------------------------- 视觉注意力后端（重要）
 # flash-attn-4 是 CuTe DSL 实现：**import 成功不代表能用** —— forward 时才现场编译
