@@ -155,6 +155,44 @@ activate_venv() {
     source .venv/bin/activate
     set -u
     info "python = $(command -v python)  ($(python -V 2>&1))"
+    prefer_venv_nccl
+}
+
+# ★ 让动态链接器优先加载【venv 里那份 NCCL】。
+#
+# 为什么必须做（实测踩坑）：
+#   NGC 系镜像的全局 LD_LIBRARY_PATH 里已经含 /usr/local/lib/python3.12/dist-packages
+#   （即容器自带 torch 的 nvidia/nccl/lib，版本 2.25.1/2.26.2，早于 sm_120 支持）。
+#   而 venv 的 torch 对 libnccl.so.2 是【不带路径的 NEEDED】引用 ——
+#   动态链接器按 LD_LIBRARY_PATH 顺序找，于是容器那份旧版【抢先被加载】。
+#   现象：uv pip 明明报"已装 2.29.7"，但 torch.cuda.nccl.version() 仍是 (2,26,2)。
+#   解法：把 venv 的 nvidia/nccl/lib 前置到 LD_LIBRARY_PATH 最前面。
+prefer_venv_nccl() {
+    local d=""
+    for cand in \
+        "$PROJECT_ROOT/.venv/lib/python3.10/site-packages/nvidia/nccl/lib" \
+        "$PROJECT_ROOT"/.venv/lib/python*/site-packages/nvidia/nccl/lib ; do
+        [[ -d "$cand" ]] && d="$cand" && break
+    done
+    if [[ -z "$d" ]]; then
+        warn "找不到 venv 的 nvidia/nccl/lib（可能尚未安装 NCCL）—— 跳过 LD_LIBRARY_PATH 调整"
+        return 0
+    fi
+    case ":${LD_LIBRARY_PATH:-}:" in
+        *":$d:"*) : ;;                                  # 已在最前，幂等
+        *) export LD_LIBRARY_PATH="$d:${LD_LIBRARY_PATH:-}" ;;
+    esac
+    # 确认生效：torch 实际报出来的 NCCL 版本
+    local v
+    v="$(python -c 'import torch;print(".".join(map(str,torch.cuda.nccl.version())))' 2>/dev/null || echo '?')"
+    if [[ "$v" == "?" ]]; then
+        warn "读不到 torch 的 NCCL 版本"
+    elif [[ "$(printf '%s\n' "2.27" "$v" | sort -V | head -1)" == "2.27" ]]; then
+        ok "torch 实际加载的 NCCL = $v（>=2.27，支持 sm_120）来自 $d"
+    else
+        warn "torch 实际加载的 NCCL = $v（<2.27，sm_120 上多卡会失败）"
+        warn "  已把 $d 前置到 LD_LIBRARY_PATH，但仍加载了旧版 —— 请跑 tools/which_nccl.py 看清单"
+    fi
 }
 
 # 带重试执行。无人值守时网络抖动不该让整个任务失败。
