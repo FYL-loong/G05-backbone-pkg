@@ -638,7 +638,21 @@ EOF
 #   实测正式训练在 DDP 构造期间报 illegal memory access，1 卡却正常。
 # ============================================================================
 do_smoke_ddp() {
-    activate_venv
+    # 优先用项目 venv；没有就用【镜像自带的 python/torch】——
+    # 这样在多卡任务里 1-2 分钟就能出结果，不必先跑 6-8 分钟的 setup。
+    local PY
+    if [[ -x .venv/bin/python ]]; then
+        activate_venv
+        PY="python"
+        info "使用项目 venv"
+    else
+        PY="python"
+        warn "没有 .venv —— 用镜像自带的 python/torch（能验通信即可，不必装依赖）"
+        if ! python -c "import torch, torch.distributed" 2>/dev/null; then
+            fail "镜像自带的 python 没有 torch —— 请先跑 MODE=setup，或用带 torch 的镜像"
+        fi
+        python -c "import torch; print('  torch', torch.__version__, 'cuda', torch.version.cuda, 'ndev', torch.cuda.device_count())"
+    fi
     local n="${GPUS:-${NPROC_PER_NODE:-${MLP_WORKER_GPU:-${MLP_WORKER_NUM:-$(nvidia-smi -L 2>/dev/null | wc -l | tr -d ' ')}}}}"
     [[ "${n:-0}" -ge 1 ]] || n=1
     info "多卡自检，GPU 数=$n"
@@ -652,7 +666,7 @@ do_smoke_ddp() {
     #    这样自检结果才能代表正式训练的启动方式。
     #    也用它自带的 `torchrun` 可执行文件，避免和官方走的模块不是同一个。
     set +e
-    python -m torch.distributed.run \
+    "$PY" -m torch.distributed.run \
         --standalone --nnodes 1 --nproc-per-node "$n" \
         tools/ddp_smoke_test.py
     local rc=$?
