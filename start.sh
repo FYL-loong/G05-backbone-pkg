@@ -890,12 +890,18 @@ PYV
     fi
 
     step "多卡 DDP/NCCL 自检（极小模型，不加载权重/数据）"
-    # ⚠️ 参数与 scripts/run/finetune.sh:321-325 的官方单机路径【完全一致】，
-    #    这样自检结果才能代表正式训练的启动方式。
+    # ⚠️ 这里【不再用 torchrun】。
+    #   实测：百舸平台会把「节点级」的 RANK/WORLD_SIZE/MASTER_* 注入容器，
+    #   而 torchrun/elastic 会继承它们，导致子进程拿到的 RANK/LOCAL_RANK 是乱值
+    #   （实测见过 16 / 29 / 206 / 228），于是
+    #       torch.cuda.set_device(local) -> RuntimeError: device id must be
+    #       non-negative! -28
+    #   进程在【进入 NCCL 之前】就死了 —— 之前所有 NCCL 环境变量实验全部失效，
+    #   因为换什么 NCCL 版本都走不到通信那一步。
+    #   改用自包含启动器：自己分配端口、清空 RANK/WORLD_SIZE、逐进程显式设
+    #   RANK/LOCAL_RANK，device 号取模防御，永不越界。
     set +e
-    "$PY" -m torch.distributed.run \
-        --standalone --nnodes 1 --nproc-per-node "$n" \
-        tools/ddp_smoke_test.py
+    "$PY" tools/nccl_multiproc_test.py --all --nproc "$n"
     local rc=$?
     set -e
     echo
@@ -987,11 +993,10 @@ EOF
         echo
         info "---- 尝试 [$nm]  命令前缀: $cmd ----"
         set +e
+        # 同样不用 torchrun（原因见上文：平台注入的 RANK/WORLD_SIZE 会污染子进程）
         # shellcheck disable=SC2086
-        $cmd "$PY" -m torch.distributed.run \
-            --standalone --nnodes 1 --nproc-per-node "$n" \
-            tools/nccl_minimal_test.py 2>&1 | \
-            grep -E 'nccl-min|Cuda failure|Unhandled|ncclUnhandled' | head -20
+        $cmd "$PY" tools/nccl_multiproc_test.py --minimal --nproc "$n" 2>&1 | \
+            grep -E '\[mp\]|Cuda failure|Unhandled|ncclUnhandled|non-negative' | head -20
         local rc2=${PIPESTATUS[0]}
         set -e
         if [[ $rc2 -eq 0 ]]; then
