@@ -723,7 +723,18 @@ def save_training_checkpoint(
     checkpoint. Pass ``optimizer=None`` / ``scheduler=None`` for a final,
     inference-only checkpoint. Extra keyword args (e.g. ``action_batch_idx``)
     are stored verbatim in the checkpoint dict.
+
+    ⚠️ 磁盘占用：每份 checkpoint 约 **34.3 GB** —— 不只是 model_state_dict
+    （2.86B 参数 fp32 = 11.44GB），还有 optimizer_state_dict（AdamW 每参数
+    2 份 fp32 = 22.88GB）。所以 **必须限制保留份数**，否则长训练会把节点
+    磁盘写满，Kubernetes 判定 DiskPressure 后 **直接 SIGTERM 驱逐容器**
+    （退出码 143，日志里没有任何 Python 报错，极难定位 —— 实测踩过）。
+
+    保留策略由环境变量 G05_KEEP_CHECKPOINTS 控制（默认 2；0 表示不清理）：
+    保存成功后只保留最近 N 个 ``step_*.pt``，其余删除。``last.pt`` 指向的
+    那个总是保留。设成 0 可恢复官方原始行为（不限份数）。
     """
+    import os
     from pathlib import Path
 
     output_dir = Path(output_dir)
@@ -745,7 +756,57 @@ def save_training_checkpoint(
     if last_pt_path.exists() or last_pt_path.is_symlink():
         last_pt_path.unlink()
     last_pt_path.symlink_to(path.relative_to(output_dir))
+
+    _prune_old_checkpoints(path.parent, keep_path=path)
     return path
+
+
+def _prune_old_checkpoints(ckpt_dir, keep_path=None):
+    """只保留最近 N 个 ``step_*.pt``，删掉更旧的（防止磁盘写满被驱逐）。
+
+    N 由 ``G05_KEEP_CHECKPOINTS`` 控制，默认 2；设为 0 则完全不清理。
+    删除失败只告警，绝不因为清理失败而中断训练。
+    """
+    import os
+    import re
+    from pathlib import Path
+
+    keep = os.environ.get("G05_KEEP_CHECKPOINTS", "2")
+    try:
+        keep = int(keep)
+    except (TypeError, ValueError):
+        keep = 2
+    if keep <= 0:
+        return
+
+    ckpt_dir = Path(ckpt_dir)
+    pat = re.compile(r"^step_(\d+)\.pt$")
+    items = []
+    for p in ckpt_dir.glob("step_*.pt"):
+        m = pat.match(p.name)
+        if m:
+            items.append((int(m.group(1)), p))
+    if len(items) <= keep:
+        return
+    items.sort(key=lambda x: x[0], reverse=True)  # 新 -> 旧
+    keep_names = {p.name for _, p in items[:keep]}
+    if keep_path is not None:
+        keep_names.add(Path(keep_path).name)
+    removed = 0
+    freed = 0
+    for _, p in items[keep:]:
+        if p.name in keep_names:
+            continue
+        try:
+            sz = p.stat().st_size
+            p.unlink()
+            removed += 1
+            freed += sz
+        except Exception as e:  # noqa: BLE001
+            print(f"[ckpt-prune] 删除 {p} 失败（忽略）: {type(e).__name__}: {e}")
+    if removed:
+        print(f"[ckpt-prune] 清理 {removed} 个旧 checkpoint，释放 {freed / 1e9:.1f} GB"
+              f"（保留最近 {keep} 个）")
 
 
 def fix_optimizer_state_after_resume(optimizer) -> int:

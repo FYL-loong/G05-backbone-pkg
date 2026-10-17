@@ -122,6 +122,15 @@ export G05_DEBUG_DDP_BCAST="${G05_DEBUG_DDP_BCAST:-0}"
 # 想试 flash-attn（装好匹配版本后）：G05_VISION_ATTN=auto 或 fa4
 export G05_VISION_ATTN="${G05_VISION_ATTN:-sdpa}"
 
+# ------------------------------------------------- 磁盘保护：限制 checkpoint 份数
+# ★ 实测踩过：每份 checkpoint ≈ 34.3 GB（model 11.44 + optimizer 22.88），
+#   官方代码【不清理】旧份数。1 纪元 68,570 步、每 2000 步一存 = 34 份
+#   = 1,166 GB，而节点可用磁盘约 535 GB。
+#   结果：写到第 15 份时磁盘满 -> Kubernetes 报 DiskPressure -> 直接 SIGTERM
+#   驱逐容器（退出码 143，日志里【没有任何 Python 报错】，极难定位）。
+# 默认只保留最近 2 份（约 69 GB），旧的在保存下一份后自动删除。
+# 设 0 可关闭（恢复官方原始行为，但长训练会写满磁盘）。
+export G05_KEEP_CHECKPOINTS="${G05_KEEP_CHECKPOINTS:-2}"
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_ROOT"
 
@@ -461,6 +470,15 @@ do_train() {
     [[ "${n:-0}" -ge 1 ]] || n=1
     info "GPU 数: $n（来源: GPUS / NPROC_PER_NODE / MLP_WORKER_GPU / MLP_WORKER_NUM / nvidia-smi）"
     info "注意：batch_size 是每卡的，全局 batch = batch_size × $n"
+    # 磁盘预算检查：每份 checkpoint 约 34.3GB（model 11.44 + optimizer 22.88）
+    local _avail
+    _avail="$(df -BG --output=avail "$G05_OUTPUT_DIR" 2>/dev/null | tail -1 | tr -dc '0-9')" || true
+    if [[ -n "${_avail:-}" ]]; then
+        info "checkpoint 保留 ${G05_KEEP_CHECKPOINTS} 份 × 34.3GB ≈ $(( ${G05_KEEP_CHECKPOINTS} * 34 )) GB（可用 ${_avail} GB）"
+        if [[ "${G05_KEEP_CHECKPOINTS}" != "0" && $(( G05_KEEP_CHECKPOINTS * 34 )) -gt "$_avail" ]]; then
+            warn "保留份数会超出可用磁盘！请调小：G05_KEEP_CHECKPOINTS=1"
+        fi
+    fi
 
     step "启动正式训练（后台 -> /workspace/train.stdout.log）"
     # ★ 透传 start.sh 收到的额外参数给 finetune.sh（它会把非 -- 开头的当作
