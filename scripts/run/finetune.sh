@@ -331,4 +331,18 @@ else
   echo "[Launch Mode] single-node: gpus=$GPU"
 fi
 
-python -m torch.distributed.run "${TORCHRUN_ARGS[@]}" scripts/finetune.py "task=$config" "${ARGS[@]}"
+# ============================================================================
+# 启动。⚠️ 单机【不用 torchrun】——
+#   百舸(AIHC)会把「节点级」的 RANK/WORLD_SIZE/MASTER_* 注入容器，torchrun 会
+#   继承它们，导致子进程拿到乱 RANK/LOCAL_RANK（实测 16/29/206/228），
+#   于是 torch.cuda.set_device(local) 报 `device id must be non-negative! -28`，
+#   【在进入 NCCL 之前】就崩 —— 表现得像"NCCL 不可用"，实际与 NCCL 无关。
+#   实测用 tools/clean_launcher.py 后 4 卡 6 项通信测试全部通过。
+#   多机场景仍走 torchrun（那里 RANK 的语义就是节点序，不能清）。
+# ============================================================================
+if [[ $MULTINODE -eq 1 ]]; then
+  python -m torch.distributed.run "${TORCHRUN_ARGS[@]}" scripts/finetune.py "task=$config" "${ARGS[@]}"
+else
+  python tools/clean_launcher.py --nproc "$GPU" -- \
+    python scripts/finetune.py "task=$config" "${ARGS[@]}"
+fi
