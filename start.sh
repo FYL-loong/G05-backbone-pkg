@@ -262,11 +262,17 @@ fi
 # src/g05/utils/eval/ 一起忽略 → 文件从未 push → 容器里 import 失败，
 # 而 setup 阶段只下载权重和数据、不 import 模型代码，发现不了，要跑到 L1 才崩。
 if [[ -f check_package.py ]]; then
-    info "包完整性检查（g05.* import 是否都能解析）..."
-    if python check_package.py .; then
+    # ⚠️ 有些镜像只有 python3（例如百舸 aihc-daft-gpu），写死 python 会误报失败
+    HOST_PY="$(command -v python 2>/dev/null || command -v python3 2>/dev/null || true)"
+    if [[ -z "$HOST_PY" ]]; then
+        warn "镜像里既没有 python 也没有 python3，跳过包完整性检查"
+    else
+    info "包完整性检查（g05.* import 是否都能解析）... [$HOST_PY]"
+    if "$HOST_PY" check_package.py .; then
         ok "包完整性通过"
     else
         fail "包完整性检查失败 —— 见上方缺失模块清单（这是【代码缺文件】，不是环境问题）"
+    fi
     fi
 else
     warn "没有 check_package.py，跳过包完整性检查"
