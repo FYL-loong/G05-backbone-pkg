@@ -911,10 +911,14 @@ EOF
    D 纯套接字
    E ★ 清掉【全部】平台注入的 NCCL 变量 —— 平台是按 A100/H800（有 NVLink+RoCE）
      注入的：NCCL_P2P_LEVEL=NVL / NCCL_MIN_NCHANNELS=8 / NCCL_VERSION=2.25.1
-     / NCCL_IB_TC=162 / NCCL_IB_HCA==mlx5_2（值带多余 '='）等。本机【无 NVLink】，
-     这些预设可能直接冲突，所以整组清掉再试。
+     / NCCL_IB_TC=162 / NCCL_IB_HCA==mlx5_2（值带多余 '='）等。本机【无 NVLink】。
    F 清全部 + 关 P2P + 关 IB
-   G 只清 P2P_LEVEL 和 NCHANNELS —— 精准定位是否这两个在捣乱
+   G 只清 P2P_LEVEL 和 NCHANNELS
+   H ★ 清全部 + MAX_NCHANNELS=1 —— 平台强制 MIN_NCHANNELS=8；纯 PCIe 上
+     8 个 channel 可能建不起来，反向强制只 1 个
+   I ★ 清全部 + PROTO=Simple —— LL/LL128 对延迟敏感，走最保守协议
+   J ★ 清全部 + ALGO=Ring —— NVLS/Tree 需要 NVLink，强制最保守算法
+   K ★ 清全部 + P2P_LEVEL=SYS —— 允许跨 NUMA 的 P2P（本机 NIC↔GPU 就是 SYS）
 EOF
     local cfg_names=(
         "A_基线"
@@ -924,8 +928,12 @@ EOF
         "E_清全部平台NCCL"
         "F_清平台+关P2P+关IB"
         "G_只清P2P_LEVEL和NCHANNELS"
+        "H_清平台+MAX_NCHANNELS=1"
+        "I_清平台+PROTO=Simple"
+        "J_清平台+ALGO=Ring"
+        "K_清平台+P2P_LEVEL=SYS"
     )
-    # 平壊/BCC 的百舸会按【宿主机拓扑】注入一整套 NCCL 变量。实测注入里有：
+    # 百舸会按【宿主机拓扑】注入一整套 NCCL 变量。实测注入里有：
     #   NCCL_VERSION=2.25.1, NCCL_P2P_LEVEL=NVL, NCCL_MIN_NCHANNELS=8,
     #   NCCL_IB_TC=162, NCCL_IB_TIMEOUT=22, NCCL_IB_QPS_PER_CONNECTION=8,
     #   NCCL_IB_HCA==mlx5_2, NCCL_SOCKET_IFNAME==eth0, ...
@@ -936,6 +944,13 @@ EOF
 -u NCCL_IB_TIMEOUT -u NCCL_IB_QPS_PER_CONNECTION -u NCCL_TOPO_FILE \
 -u NCCL_SOCKET_IFNAME -u NCCL_SHARP_DISABLE -u NCCL_COLLNET_ENABLE"
     local CLEAR_RDMA="env -u NCCL_IB_HCA -u NCCL_IB_GID_INDEX -u NCCL_IB_ADAPTIVE_ROUTING -u NCCL_TOPO_FILE"
+    # ★ H~K 是还没试过的方向：
+    #   NCCL_MIN_NCHANNELS=8 被平台注入，等于【强制至少 8 个 channel】。
+    #   纯 PCIe、无 NVLink 的机器上 8 个 channel 可能建不起来 —— 所以反向试
+    #   MAX_NCHANNELS=1（强制只 1 个 channel）。
+    #   PROTO/ALGO 方面：LL/LL128 对延迟敏感，NVLS/Tree 需要 NVLink，
+    #   强制 Simple + Ring 走最保守的路径。
+    #   P2P_LEVEL=SYS 允许跨 NUMA 的 P2P（本机 NIC 与 GPU 就是 SYS）。
     local cfg_cmds=(
         "env"
         "$CLEAR_RDMA"
@@ -944,6 +959,10 @@ EOF
         "$CLEAR_ALL_NCCL"
         "$CLEAR_ALL_NCCL NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1"
         "env -u NCCL_P2P_LEVEL -u NCCL_MIN_NCHANNELS"
+        "$CLEAR_ALL_NCCL NCCL_MAX_NCHANNELS=1 NCCL_P2P_DISABLE=1"
+        "$CLEAR_ALL_NCCL NCCL_PROTO=Simple NCCL_P2P_DISABLE=1"
+        "$CLEAR_ALL_NCCL NCCL_ALGO=Ring NCCL_P2P_DISABLE=1"
+        "$CLEAR_ALL_NCCL NCCL_P2P_LEVEL=SYS NCCL_P2P_DISABLE=0"
     )
     local worked=()
     local idx
