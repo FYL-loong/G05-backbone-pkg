@@ -739,14 +739,23 @@ do_smoke_ddp() {
         PY="python"
         warn "G05_SMOKE_IN_VENV=0 —— 强制用【容器自带】python 测（注意：正式训练用的是 .venv）"
     else
-        PY="python"
+        # ⚠️ 有些镜像（例如百舸 aihc-daft-gpu）只提供 python3，没有 python 命令。
+        #    直接写死 PY="python" 会在这种镜像里报 command not found。
+        if command -v python >/dev/null 2>&1; then
+            PY="python"
+        elif command -v python3 >/dev/null 2>&1; then
+            PY="python3"
+            warn "镜像没有 python 命令，改用 python3"
+        else
+            fail "镜像里既没有 python 也没有 python3"
+        fi
         warn "没有 .venv —— 只能用【容器自带】python 测"
         warn "⚠️ 正式训练用的是 .venv 的 torch，两者 NCCL 不同 —— 本次结果不能代表正式训练"
         warn "   想测正式训练的环境：先跑 MODE=setup 装出 .venv，再跑 MODE=smoke-ddp"
-        if ! python -c "import torch, torch.distributed" 2>/dev/null; then
-            fail "镜像自带的 python 没有 torch —— 请先跑 MODE=setup，或用带 torch 的镜像"
+        if ! "$PY" -c "import torch, torch.distributed" 2>/dev/null; then
+            fail "镜像自带的 $PY 没有 torch —— 请先跑 MODE=setup，或用带 torch 的镜像"
         fi
-        python -c "import torch; print('  容器 torch', torch.__version__, 'cuda', torch.version.cuda, 'ndev', torch.cuda.device_count())"
+        "$PY" -c "import torch; print('  容器 torch', torch.__version__, 'cuda', torch.version.cuda, 'ndev', torch.cuda.device_count())"
     fi
     local n="${GPUS:-${NPROC_PER_NODE:-${MLP_WORKER_GPU:-${MLP_WORKER_NUM:-$(nvidia-smi -L 2>/dev/null | wc -l | tr -d ' ')}}}}"
     [[ "${n:-0}" -ge 1 ]] || n=1
