@@ -1108,6 +1108,13 @@ do_eval() {
     local n_ds
     n_ds="$(ls -d data/yam/*_lerobot 2>/dev/null | wc -l | tr -d ' ')"
     ok "基座/数据集就绪（$n_ds 个数据集）"
+    # cv2：eval_open_loop.py:45 顶层就 import visualize → import cv2，
+    # opencv-python 需要系统 libGL。训练链路不 import cv2，所以没暴露过。
+    # setup_env.sh 4.7 已自动修；这里前置拦一下，避免又跑到一半才抛原始 traceback。
+    if ! .venv/bin/python -c "import cv2" >/dev/null 2>&1; then
+        fail "venv 里 import cv2 失败（opencv 需要 libGL，或 opencv-python-headless 未装）—— 重跑 MODE=setup（已加自动修复）"
+    fi
+    ok "cv2 可用（$(.venv/bin/python -c 'import cv2;print(cv2.__version__)' 2>/dev/null)）"
     if [[ ! -f checkpoints/action_tokenizer.pt ]]; then
         warn "缺少官方 codec checkpoints/action_tokenizer.pt —— 基座基线(B)会失败"
         warn "  修复：MODE=setup 重跑（download_weights.sh 已加入该文件下载）"

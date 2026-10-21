@@ -243,6 +243,47 @@ else
     info "G05_NCCL_UPGRADE=0 —— 不改 NCCL（sm_120 上 4 卡会失败）"
 fi
 
+# ---------------------------------------------------------------- 4.7 cv2 的 libGL 依赖
+# 为什么需要：训练链路不 import cv2，所以这个问题一直没暴露；
+#   但【离线评测】会走 scripts/eval_open_loop.py:45 → g05/utils/eval/visualize.py:18
+#   → `import cv2`，而依赖里的 opencv-python==4.10.0.84 需要系统 libGL.so.1，
+#   pytorch-ngc 镜像默认不带 → ImportError: libGL.so.1: cannot open shared object file。
+#
+# 两种修法，优先 apt（不动 Python 依赖，uv.lock 保持原样）：
+#   ① apt install libgl1
+#   ② 换 opencv-python-headless（不需要 libGL），版本与 pyproject 对齐为 4.10.0.84
+# 判据用【真的 import 一次】，不信 ldconfig（ldconfig 常在 PATH 外）。
+CV_PY="$PROJECT_ROOT/.venv/bin/python"
+if [[ -x "$CV_PY" ]] && ! "$CV_PY" -c "import cv2" >/dev/null 2>&1; then
+    warn "venv 里 import cv2 失败（opencv 需要系统 libGL，仅【评测】用到，训练不受影响）"
+    if apt-get update -qq >/tmp/apt_libgl.log 2>&1 \
+       && apt-get install -y -qq libgl1 >>/tmp/apt_libgl.log 2>&1; then
+        : # 下面用 import 复验，不在这里断言
+    else
+        warn "apt 安装 libgl1 失败（见 /tmp/apt_libgl.log），改走 headless 方案"
+    fi
+    if "$CV_PY" -c "import cv2" >/dev/null 2>&1; then
+        ok_sync "cv2 可用（apt libgl1，$( "$CV_PY" -c 'import cv2;print(cv2.__version__)' 2>/dev/null )）"
+    else
+        info "替换 opencv-python → opencv-python-headless==4.10.0.84（后者不依赖 libGL）"
+        uv pip uninstall --python "$CV_PY" opencv-python >>/tmp/cv_headless.log 2>&1 || true
+        if uv pip install --python "$CV_PY" "opencv-python-headless==4.10.0.84" \
+                >>/tmp/cv_headless.log 2>&1; then
+            if "$CV_PY" -c "import cv2" >/dev/null 2>&1; then
+                ok_sync "cv2 可用（opencv-python-headless，$( "$CV_PY" -c 'import cv2;print(cv2.__version__)' 2>/dev/null )）"
+            else
+                warn "装了 headless 但 import cv2 仍失败 —— 评测会起不来，见 /tmp/cv_headless.log"
+            fi
+        else
+            warn "opencv-python-headless 安装失败 —— 评测会起不来，见 /tmp/cv_headless.log"
+        fi
+    fi
+else
+    if [[ -x "$CV_PY" ]]; then
+        ok_sync "cv2 可用（$("$CV_PY" -c 'import cv2;print(cv2.__version__)' 2>/dev/null)）"
+    fi
+fi
+
 # ---------------------------------------------------------------- 5. 验证
 info "验证环境 ..."
 VENV_PY="$PROJECT_ROOT/.venv/bin/python"
