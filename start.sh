@@ -1066,6 +1066,166 @@ EOF
     return 0
 }
 
+# ============================================================================
+# eval：离线 open-loop 评测（A=我们微调的 vs B=官方基座）
+#
+# 为什么需要：训练只给出 loss，不证明「在没见过的新任务上好不好」。
+#   我们的验证集是完整留出的两个任务（TASK-YAM-0014/0015），
+#   所以 open-loop L1 衡量的是零样本泛化。
+#
+# 为什么必须 A/B 两次：单看 ar_action_l1=0.05 无法判断好坏，
+#   必须和官方基座在同一份数据、同一参数下比。
+#
+# 前置：MODE=setup 已跑过（.venv / 基座权重 / 数据集齐备）。
+#
+# 环境变量：
+#   EVAL_EPISODES     评多少条 episode，默认 20（脚本默认只评 1 条，统计无意义）
+#   EVAL_RUN_NAME     我们 run 目录名，默认 yam-ft-1ep
+#   EVAL_SRC_REPO     微调产物的 HF 仓库，默认 Zenith6666/yam-backbone
+#   EVAL_SKIP_BASE    1 = 只评 A，不跑基座
+#   EVAL_UPLOAD       1 = 把 metrics.json 上传到 HF（默认 1）
+#   EVAL_UPLOAD_VIZ   1 = 连 episodes/ 可视化一起上传（默认 0，可能几十 MB）
+# ============================================================================
+do_eval() {
+    require_hf_token
+    activate_venv
+
+    local ne="${EVAL_EPISODES:-20}"
+    local run_name="${EVAL_RUN_NAME:-yam-ft-1ep}"
+    local src_repo="${EVAL_SRC_REPO:-Zenith6666/yam-backbone}"
+
+    local A_RUN="$PROJECT_ROOT/runs/$run_name"
+    local A_CKPT="$A_RUN/checkpoints/model_state_dict.pt"
+    local B_RUN="$PROJECT_ROOT/checkpoints/g05-base"
+    local B_CKPT="$B_RUN/checkpoints/model_state_dict.pt"
+
+    step "0. 前置检查"
+    [[ -x .venv/bin/python ]] || fail "没有 .venv —— 先跑 MODE=setup"
+    [[ -d "$B_RUN" ]] || fail "缺少官方基座 $B_RUN —— 先跑 MODE=setup"
+    if ! ls -d data/yam/*_lerobot >/dev/null 2>&1; then
+        fail "缺少数据集 data/yam/*_lerobot —— 先跑 MODE=setup"
+    fi
+    local n_ds
+    n_ds="$(ls -d data/yam/*_lerobot 2>/dev/null | wc -l | tr -d ' ')"
+    ok "基座/数据集就绪（$n_ds 个数据集）"
+    if [[ ! -f checkpoints/action_tokenizer.pt ]]; then
+        warn "缺少官方 codec checkpoints/action_tokenizer.pt —— 基座基线(B)会失败"
+        warn "  修复：MODE=setup 重跑（download_weights.sh 已加入该文件下载）"
+    fi
+
+    # ---------------------------------------------------------------- 组装 A 的 run 目录
+    # find_run_dir 会从 ckpt 往上找 5 层内的 .hydra/config.yaml，
+    # 所以必须是 <run>/checkpoints/model_state_dict.pt 这个层级。
+    if [[ -f "$A_CKPT" && -f "$A_RUN/.hydra/config.yaml" \
+          && -f "$A_RUN/dataset_stats.json" && -f "$A_RUN/action_tokenizer.pt" ]]; then
+        ok "run 目录已存在且完整：$A_RUN"
+    else
+        step "1. 从 HF 组装我们微调的 run 目录（$src_repo）"
+        mkdir -p "$A_RUN/checkpoints" "$A_RUN/.hydra"
+        local tmp="" rc=0
+        tmp="$(mktemp -d)"
+        _hfget() {   # $1=repo 内路径  $2=目标
+            info "下载 $src_repo :: $1"
+            rm -rf "$tmp/dl"; mkdir -p "$tmp/dl"
+            if ! hf download "$src_repo" "$1" --repo-type model --local-dir "$tmp/dl" >/dev/null 2>&1; then
+                warn "hf download 失败：$1"; return 1
+            fi
+            local src="$tmp/dl/$1"
+            [[ -f "$src" ]] || { warn "下载后找不到 $src"; return 1; }
+            mkdir -p "$(dirname "$2")"
+            mv -f "$src" "$2"
+        }
+        _hfget "hydra_config.yaml"     "$A_RUN/.hydra/config.yaml" || rc=1
+        _hfget "dataset_stats.json"    "$A_RUN/dataset_stats.json" || rc=1
+        _hfget "action_tokenizer.pt"   "$A_RUN/action_tokenizer.pt" || rc=1
+        _hfget "model_state_dict.pt"   "$A_CKPT" || rc=1
+        rm -rf "$tmp"
+        [[ $rc -eq 0 ]] || fail "组装 run 目录失败（见上方日志）"
+        ok "run 目录组装完成：$A_RUN"
+    fi
+
+    # ---------------------------------------------------------------- A：我们的
+    step "2. 评测 A（微调 backbone + YAM codec），${ne} 条 episode"
+    info "命令：bash scripts/run/eval_open_loop.sh --ckpt_path $A_CKPT eval_episodes_num=$ne"
+    bash scripts/run/eval_open_loop.sh --ckpt_path "$A_CKPT" \
+        "eval_episodes_num=$ne" || fail "A 评测失败（见上方日志）"
+    local A_MET="$A_RUN/eval_model_state_dict/metrics.json"
+    [[ -f "$A_MET" ]] || fail "A 没有产出 metrics.json（$A_MET）"
+    ok "A 完成：$A_MET"
+
+    # ---------------------------------------------------------------- B：官方基座
+    local B_MET="$B_RUN/eval_model_state_dict/metrics.json"
+    if [[ "${EVAL_SKIP_BASE:-0}" == "1" ]]; then
+        warn "EVAL_SKIP_BASE=1 —— 跳过基座基线（无法做 A/B 对比）"
+    else
+        step "3. 评测 B（官方基座 backbone + 官方 codec），${ne} 条 episode"
+        info "命令：bash scripts/run/eval_open_loop.sh --ckpt_path $B_CKPT eval_episodes_num=$ne"
+        if bash scripts/run/eval_open_loop.sh --ckpt_path "$B_CKPT" \
+                "eval_episodes_num=$ne"; then
+            [[ -f "$B_MET" ]] && ok "B 完成：$B_MET" || warn "B 未产出 metrics.json"
+        else
+            warn "B 评测失败 —— 常见原因：官方 codec 缺失（checkpoints/action_tokenizer.pt）"
+            warn "  仍会打印 A 的绝对指标；A/B 对比需修好后再跑"
+        fi
+    fi
+
+    # ---------------------------------------------------------------- 对比
+    step "4. 结果对比"
+    if [[ -f "$A_MET" && -f "$B_MET" && "${EVAL_SKIP_BASE:-0}" != "1" ]]; then
+        set +e
+        python tools/eval_compare.py "$A_MET" "$B_MET" \
+            --label-a "A(微调)" --label-b "B(基座)" || true
+        set -e
+    else
+        python - "$A_MET" <<'PYA' || true
+import json, sys
+path = sys.argv[1]
+d = json.load(open(path, encoding="utf-8"))
+print("  === A（微调）的绝对指标 ===")
+for k in sorted(d):
+    print(f"    {k:<38} {float(d[k]):.6f}")
+print()
+print("  注意：没有 B 基线时，这些数字无法判断好坏。")
+print("  参考点：训练时验证集上 fm_loss≈1.75 / ce_loss 见 logs/train.log")
+PYA
+    fi
+
+    # ---------------------------------------------------------------- 上传
+    if [[ "${EVAL_UPLOAD:-1}" == "1" ]]; then
+        step "5. 上传评测结果到 HF"
+        local repo="${HF_REPO_ID:-Zenith6666/yam-backbone}"
+        hf upload "$repo" "$A_MET" "eval/A/metrics.json" --repo-type model \
+            >/dev/null 2>&1 && ok "已上传 eval/A/metrics.json" || warn "A metrics 上传失败"
+        if [[ -f "$B_MET" ]]; then
+            hf upload "$repo" "$B_MET" "eval/B/metrics.json" --repo-type model \
+                >/dev/null 2>&1 && ok "已上传 eval/B/metrics.json" || warn "B metrics 上传失败"
+        fi
+        if [[ "${EVAL_UPLOAD_VIZ:-0}" == "1" ]]; then
+            for side in A B; do
+                local d="$PROJECT_ROOT/runs/$run_name/eval_model_state_dict"
+                [[ "$side" == "B" ]] && d="$B_RUN/eval_model_state_dict"
+                if [[ -d "$d/episodes" ]]; then
+                    hf upload "$repo" "$d/episodes" "eval/$side/episodes" --repo-type model \
+                        >/dev/null 2>&1 && ok "已上传 eval/$side/episodes/" || warn "$side 可视化上传失败"
+                fi
+            done
+        else
+            info "EVAL_UPLOAD_VIZ=0 —— 可视化留在容器内（销毁即失）；需要就设 1 再跑"
+        fi
+    fi
+
+    cat <<EOF
+
+  产物位置：
+     A（微调）: $A_MET
+                $A_RUN/eval_model_state_dict/episodes/   （GT vs 预测图）
+     B（基座）: $B_MET
+
+  ★ 必做：打开 episodes/ 里的对比图，逐关节检查【量级 / 符号 / 是否某关节不动】。
+     L1 是平均值，会掩盖"符号反了""量级差 10 倍"这类上真机直接崩的问题。
+EOF
+}
+
 # ---------------------------------------------------------------- 分发
 # ⚠️ 必须把 start.sh 收到的额外参数透传给 do_train，否则
 #    `bash start.sh model.max_epochs=1` 会静默失效（用户以为 1 epoch，实际 10 epoch）。
@@ -1074,6 +1234,7 @@ case "$MODE" in
     smoke-ddp) do_smoke_ddp ;;
     setup)  do_setup ;;
     verify) do_verify ;;
+    eval)   do_eval ;;
     train)  do_train "$@" ;;
     all)
         do_setup

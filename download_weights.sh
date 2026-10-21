@@ -111,6 +111,13 @@ dl "$BASE_REPO" "g05-base/.hydra/config.yaml" \
 dl "$BASE_REPO" "g05-base/dataset_stats.json" \
    "checkpoints/g05-base/dataset_stats.json" || warn "dataset_stats 缺失（非致命）"
 
+# 官方 ActionCodec（506MB）—— 只在【离线评测做 A/B 对比】时需要：
+#   官方基座的 run 目录 config 里 tokenizer.ckpt_dir 指向 checkpoints/action_tokenizer.pt，
+#   不下载这份，用基座权重跑 eval 会因找不到 codec 而失败。
+#   非致命：训练/推理都用不到它（我们用微调后的 action_tokenizer_yam.pt）。
+dl "$BASE_REPO" "action_tokenizer.pt" "checkpoints/action_tokenizer.pt" \
+  || warn "官方 codec 下载失败（仅影响 eval 的 B 基线，训练/推理不需要）"
+
 echo "--- processor（8 个小文件；浅层 glob 已验证可用）---"
 hf download "$BASE_REPO" --repo-type model --local-dir checkpoints \
   --include "qwen3_5_2b_base_processor/*" || fail "processor 下载失败"
