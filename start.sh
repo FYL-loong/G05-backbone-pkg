@@ -1332,9 +1332,20 @@ PYA
             for side in A B; do
                 local d="$PROJECT_ROOT/runs/$run_name/eval_model_state_dict"
                 [[ "$side" == "B" ]] && d="$B_RUN/eval_model_state_dict"
-                if [[ -d "$d/episodes" ]]; then
-                    hf upload "$repo" "$d/episodes" "eval/$side/episodes" --repo-type model \
-                        >/dev/null 2>&1 && ok "已上传 eval/$side/episodes/" || warn "$side 可视化上传失败"
+                # ⚠️ episodes 不在 <root>/episodes —— mixture 模式下是
+                #    <root>/<embodiment>/episodes（实测 .../galaxea_r1lite/episodes/）。
+                #    用 find 找，别写死层级。
+                local ep
+                ep="$(find "$d" -maxdepth 3 -type d -name episodes -print -quit 2>/dev/null || true)"
+                if [[ -n "$ep" && -d "$ep" ]]; then
+                    local nf
+                    nf="$(find "$ep" -type f 2>/dev/null | wc -l | tr -d ' ')"
+                    info "上传 $side 的可视化（$nf 个文件，$ep）..."
+                    hf upload "$repo" "$ep" "eval/$side/episodes" --repo-type model \
+                        >/dev/null 2>&1 && ok "已上传 eval/$side/episodes/（$nf 个文件）" \
+                        || warn "$side 可视化上传失败（本地仍在 $ep）"
+                else
+                    warn "$side 没找到 episodes 目录（在 $d 下），可视化未上传"
                 fi
             done
         else
