@@ -79,13 +79,22 @@ def main() -> int:
                 ma["AT_CONFIG"] = copy.deepcopy(vq)
                 changed.append("model.model_arch.AT_CONFIG -> 展开为具体 dict")
 
-    # ---- ③ 可选：覆盖 codec 路径（两处都改，避免再依赖解析顺序）
+    # ---- ③ 可选：覆盖 codec 路径
+    # 注意 AT_CONFIG 在 ② 里已被复制成独立副本，必须一并改，
+    # 否则 AT_CONFIG 与 model.tokenizer.vq_config 会出现两个不同的 ckpt_dir。
     if a.codec_path:
-        for owner, label in ((root_tok, "tokenizer"), (model.get("tokenizer") if isinstance(model, dict) else None,
-                                                      "model.tokenizer")):
+        ma2 = (model or {}).get("model_arch") if isinstance(model, dict) else None
+        for owner, label in (
+            (root_tok, "tokenizer"),
+            (model.get("tokenizer") if isinstance(model, dict) else None, "model.tokenizer"),
+            (ma2.get("AT_CONFIG") if isinstance(ma2, dict) else None, "model.model_arch.AT_CONFIG"),
+        ):
             if isinstance(owner, dict) and isinstance(owner.get("vq_config"), dict):
                 owner["vq_config"]["ckpt_dir"] = a.codec_path
                 changed.append(f"{label}.vq_config.ckpt_dir -> {a.codec_path}")
+            elif isinstance(owner, dict) and label.endswith("AT_CONFIG"):
+                owner["ckpt_dir"] = a.codec_path
+                changed.append(f"{label}.ckpt_dir -> {a.codec_path}")
 
     if not changed:
         print("[cfg-patch] 无需改动（没有找到链式插值）")

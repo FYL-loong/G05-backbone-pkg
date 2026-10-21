@@ -1210,19 +1210,43 @@ do_eval() {
         # 注：stats 不由 CLI 决定 —— eval_open_loop.py:707 固定读
         #     cfg.run_dir/dataset_stats.json，而 run_dir 由 ckpt 路径上溯得到，
         #     所以 B 会自动用 checkpoints/g05-base/dataset_stats.json（官方那份）。
+        #
+        # ⚠️ codec 路径必须【三处一起】override：
+        #   load_config_from_task_yaml L253-254 已 OmegaConf.resolve + to_container，
+        #   于是 tokenizer / model.tokenizer.vq_config / AT_CONFIG 变成三份【独立副本】。
+        #   只改 tokenizer.vq_config.ckpt_dir 无效 —— tokenizer 实际读的是
+        #   model.tokenizer.vq_config.ckpt_dir（实测 B 因此错误地加载了 YAM codec，
+        #   基座不认识 YAM token 语义，对比被夸大）。
+        local OFFICIAL_CODEC="$PROJECT_ROOT/checkpoints/action_tokenizer.pt"
         info "命令：eval_open_loop.sh --task_config configs/task/yam.yaml \\"
         info "        --ckpt_path $B_CKPT eval_episodes_num=$ne \\"
-        info "        tokenizer.vq_config.ckpt_dir=checkpoints/action_tokenizer.pt"
+        info "        tokenizer.vq_config.ckpt_dir=<官方 codec>\\"
+        info "        model.tokenizer.vq_config.ckpt_dir=<官方 codec>\\"
+        info "        model.model_arch.AT_CONFIG.ckpt_dir=<官方 codec>"
         set +e
         bash scripts/run/eval_open_loop.sh \
             --task_config configs/task/yam.yaml \
             --ckpt_path "$B_CKPT" \
             "eval_episodes_num=$ne" \
-            "tokenizer.vq_config.ckpt_dir=$PROJECT_ROOT/checkpoints/action_tokenizer.pt" \
+            "tokenizer.vq_config.ckpt_dir=$OFFICIAL_CODEC" \
+            "model.tokenizer.vq_config.ckpt_dir=$OFFICIAL_CODEC" \
+            "model.model_arch.AT_CONFIG.ckpt_dir=$OFFICIAL_CODEC" \
             2>&1 | tee "$B_LOG"
         local brc=${PIPESTATUS[0]}
         set -e
         B_MET="$(find "$B_RUN/eval_model_state_dict" -maxdepth 2 -name metrics.json -print -quit 2>/dev/null || true)"
+        # ---- 自检：B 是否真的用了【官方】codec。用错就会得到"基座+YAM码本"的
+        #      错配结果（token 语义对不上），会让 A/B 的差距被严重夸大。
+        local b_codec
+        b_codec="$(grep -oE 'checkpoints/action_tokenizer[a-z_]*\.pt' "$B_LOG" 2>/dev/null | tail -1 || true)"
+        if [[ "$b_codec" == *"action_tokenizer_yam.pt"* ]]; then
+            warn "★★ B 错误地加载了【YAM codec】（$b_codec）—— 基座不认识 YAM 的 token 语义，"
+            warn "   A/B 对比【不可信】。override 未生效，需修 start.sh 后重跑。"
+        elif [[ "$b_codec" == *"action_tokenizer.pt"* ]]; then
+            ok "B 自检通过：加载的是【官方 codec】（$b_codec）"
+        else
+            warn "B 自检：未能从日志判定使用了哪个 codec（$b_codec）"
+        fi
         if [[ $brc -eq 0 && -n "$B_MET" && -f "$B_MET" ]]; then
             ok "B 完成：$B_MET"
         else
