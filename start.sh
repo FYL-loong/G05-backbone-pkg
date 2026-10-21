@@ -1145,27 +1145,77 @@ do_eval() {
     fi
 
     # ---------------------------------------------------------------- A：我们的
-    step "2. 评测 A（微调 backbone + YAM codec），${ne} 条 episode"
+    step "2. 评测 A（微调 backbone + YAM codec + YAM stats），${ne} 条 episode"
+    local logd="$PROJECT_ROOT/eval_logs"
+    mkdir -p "$logd"
+    local A_LOG="$logd/eval_A.log"
     info "命令：bash scripts/run/eval_open_loop.sh --ckpt_path $A_CKPT eval_episodes_num=$ne"
+    set +e
     bash scripts/run/eval_open_loop.sh --ckpt_path "$A_CKPT" \
-        "eval_episodes_num=$ne" || fail "A 评测失败（见上方日志）"
+        "eval_episodes_num=$ne" 2>&1 | tee "$A_LOG"
+    local arc=${PIPESTATUS[0]}
+    set -e
+    [[ $arc -eq 0 ]] || { warn "A 评测失败（rc=$arc），日志：$A_LOG"; tail -40 "$A_LOG" || true; fail "A 失败"; }
     local A_MET="$A_RUN/eval_model_state_dict/metrics.json"
     [[ -f "$A_MET" ]] || fail "A 没有产出 metrics.json（$A_MET）"
     ok "A 完成：$A_MET"
 
     # ---------------------------------------------------------------- B：官方基座
     local B_MET="$B_RUN/eval_model_state_dict/metrics.json"
+    local B_LOG="$logd/eval_B.log"
     if [[ "${EVAL_SKIP_BASE:-0}" == "1" ]]; then
         warn "EVAL_SKIP_BASE=1 —— 跳过基座基线（无法做 A/B 对比）"
+    elif [[ ! -f checkpoints/action_tokenizer.pt ]]; then
+        # 没有官方 codec 就没法让基座按它自己的 token 语义解码，此时跑 B 只会得到乱码，
+        # 不如明确跳过 —— 避免"跑出个数字但其实无意义"。
+        warn "缺少官方 codec checkpoints/action_tokenizer.pt，跳过 B（否则结果无意义）"
+        warn "修复：重跑 MODE=setup（download_weights.sh 已加入该文件）"
     else
-        step "3. 评测 B（官方基座 backbone + 官方 codec），${ne} 条 episode"
-        info "命令：bash scripts/run/eval_open_loop.sh --ckpt_path $B_CKPT eval_episodes_num=$ne"
-        if bash scripts/run/eval_open_loop.sh --ckpt_path "$B_CKPT" \
-                "eval_episodes_num=$ne"; then
-            [[ -f "$B_MET" ]] && ok "B 完成：$B_MET" || warn "B 未产出 metrics.json"
+        step "3. 评测 B（官方基座 backbone + 官方 codec + 官方 stats），${ne} 条 episode"
+        # ★ 关键：用 --task_config configs/task/yam.yaml 而不是基座自带的 .hydra/config.yaml。
+        #   原因：基座那分配置是【官方预训练配置】，它的 data 段指向官方预训练数据集，
+        #   那些目录在我们容器里不存在 —— 要么直接报错，要么（更糟）静默评了错的数据，
+        #   导致 A/B 不可比。用 yam.yaml 保证 A 和 B 走【完全相同的 YAM 数据管线】。
+        #   模型侧仍保持"原版"：基座权重 + 官方 codec（+ 官方 stats，见下）。
+        #
+        # 注：stats 不由 CLI 决定 —— eval_open_loop.py:707 固定读
+        #     cfg.run_dir/dataset_stats.json，而 run_dir 由 ckpt 路径上溯得到，
+        #     所以 B 会自动用 checkpoints/g05-base/dataset_stats.json（官方那份）。
+        info "命令：eval_open_loop.sh --task_config configs/task/yam.yaml \\"
+        info "        --ckpt_path $B_CKPT eval_episodes_num=$ne \\"
+        info "        tokenizer.vq_config.ckpt_dir=checkpoints/action_tokenizer.pt"
+        set +e
+        bash scripts/run/eval_open_loop.sh \
+            --task_config configs/task/yam.yaml \
+            --ckpt_path "$B_CKPT" \
+            "eval_episodes_num=$ne" \
+            "tokenizer.vq_config.ckpt_dir=$PROJECT_ROOT/checkpoints/action_tokenizer.pt" \
+            2>&1 | tee "$B_LOG"
+        local brc=${PIPESTATUS[0]}
+        set -e
+        if [[ $brc -eq 0 && -f "$B_MET" ]]; then
+            ok "B 完成：$B_MET"
         else
-            warn "B 评测失败 —— 常见原因：官方 codec 缺失（checkpoints/action_tokenizer.pt）"
-            warn "  仍会打印 A 的绝对指标；A/B 对比需修好后再跑"
+            warn "B 评测失败（rc=$brc），日志：$B_LOG"
+            tail -40 "$B_LOG" 2>/dev/null || true
+            warn "仍会打印 A 的绝对指标；A/B 对比需修好 B 后再跑"
+        fi
+    fi
+
+    # ---------------------------------------------------------------- 可比性自检
+    # 断言 A 和 B 看到的是【同一份数据集】。否则对比无意义 —— 这一步由脚本自己判定，
+    # 不依赖人工看日志。
+    if [[ -f "$A_LOG" && -f "$B_LOG" && -f "$B_MET" ]]; then
+        local a_tot b_tot
+        a_tot="$(grep -oE 'out of [0-9]+ total' "$A_LOG" | tail -1 | grep -oE '[0-9]+' || true)"
+        b_tot="$(grep -oE 'out of [0-9]+ total' "$B_LOG" | tail -1 | grep -oE '[0-9]+' || true)"
+        info "数据集规模自检： A out-of-total=${a_tot:-?}   B out-of-total=${b_tot:-?}"
+        if [[ -n "$a_tot" && -n "$b_tot" && "$a_tot" != "$b_tot" ]]; then
+            fail "A 和 B 评的不是同一份数据集（$a_tot vs $b_tot）—— 对比无意义，已中止"
+        elif [[ -n "$a_tot" && "$a_tot" == "$b_tot" ]]; then
+            ok "A/B 数据集一致（共 $a_tot 条 episode），对比有效"
+        else
+            warn "未能解析出 episode 总数，跳过一致性断言（请人工核对两条日志）"
         fi
     fi
 
