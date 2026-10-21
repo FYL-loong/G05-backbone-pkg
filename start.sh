@@ -1123,8 +1123,18 @@ do_eval() {
     # ---------------------------------------------------------------- 组装 A 的 run 目录
     # find_run_dir 会从 ckpt 往上找 5 层内的 .hydra/config.yaml，
     # 所以必须是 <run>/checkpoints/model_state_dict.pt 这个层级。
+    #
+    # ⚠️ 故意【不】把 action_tokenizer.pt 放进 run 目录：
+    #   load_config_from_run_dir 的 _apply_action_tokenizer_sidecar 一旦发现
+    #   run_dir/action_tokenizer.pt 存在，就会 OmegaConf.update 三处 ckpt_dir；
+    #   而我们的配置里 tokenizer 是【链式插值】(tokenizer: ${tokenizer},
+    #   model_arch.action_tokenizer: ${model.tokenizer._target_})，
+    #   实测在评测环境里会变成
+    #       InterpolationKeyError: 'model.tokenizer._target_' not found
+    #   不放这个文件 → sidecar 直接返回 False、零改动；
+    #   配置里的 ckpt_dir: checkpoints/action_tokenizer_yam.pt（相对项目根）仍能命中。
     if [[ -f "$A_CKPT" && -f "$A_RUN/.hydra/config.yaml" \
-          && -f "$A_RUN/dataset_stats.json" && -f "$A_RUN/action_tokenizer.pt" ]]; then
+          && -f "$A_RUN/dataset_stats.json" && -f "$A_RUN/.hydra/config.yaml.patched" ]]; then
         ok "run 目录已存在且完整：$A_RUN"
     else
         step "1. 从 HF 组装我们微调的 run 目录（$src_repo）"
@@ -1144,10 +1154,18 @@ do_eval() {
         }
         _hfget "hydra_config.yaml"     "$A_RUN/.hydra/config.yaml" || rc=1
         _hfget "dataset_stats.json"    "$A_RUN/dataset_stats.json" || rc=1
-        _hfget "action_tokenizer.pt"   "$A_RUN/action_tokenizer.pt" || rc=1
         _hfget "model_state_dict.pt"   "$A_CKPT" || rc=1
         rm -rf "$tmp"
         [[ $rc -eq 0 ]] || fail "组装 run 目录失败（见上方日志）"
+
+        # 把链式插值就地展开（否则 to_container 会报 InterpolationKeyError）
+        # ⚠️ 用 .venv/bin/python（activate_venv 之后 python 也可，但显式更稳；
+        #    注意 $PY 只是 do_smoke_ddp 的局部变量，这里不能用）
+        info "展开配置里的链式插值（model.tokenizer / action_tokenizer / AT_CONFIG）..."
+        .venv/bin/python tools/prepare_eval_config.py "$A_RUN/.hydra/config.yaml" \
+            --codec-path "checkpoints/action_tokenizer_yam.pt" \
+            || fail "配置展开失败"
+        touch "$A_RUN/.hydra/config.yaml.patched"
         ok "run 目录组装完成：$A_RUN"
     fi
 
