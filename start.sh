@@ -1237,8 +1237,11 @@ do_eval() {
         B_MET="$(find "$B_RUN/eval_model_state_dict" -maxdepth 2 -name metrics.json -print -quit 2>/dev/null || true)"
         # ---- 自检：B 是否真的用了【官方】codec。用错就会得到"基座+YAM码本"的
         #      错配结果（token 语义对不上），会让 A/B 的差距被严重夸大。
+        # ⚠️ 必须先把换行去掉再 grep：平台日志按 80 字符折行，路径会被切成
+        #    ".../checkpoint" + "s/action_tokenizer.pt"，逐行 grep 永远匹配不到。
         local b_codec
-        b_codec="$(grep -oE 'checkpoints/action_tokenizer[a-z_]*\.pt' "$B_LOG" 2>/dev/null | tail -1 || true)"
+        b_codec="$(tr -d '\n' < "$B_LOG" 2>/dev/null \
+                   | grep -oE 'checkpoints/action_tokenizer[a-z_]*\.pt' | tail -1 || true)"
         if [[ "$b_codec" == *"action_tokenizer_yam.pt"* ]]; then
             warn "★★ B 错误地加载了【YAM codec】（$b_codec）—— 基座不认识 YAM 的 token 语义，"
             warn "   A/B 对比【不可信】。override 未生效，需修 start.sh 后重跑。"
