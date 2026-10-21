@@ -1181,12 +1181,16 @@ do_eval() {
     local arc=${PIPESTATUS[0]}
     set -e
     [[ $arc -eq 0 ]] || { warn "A 评测失败（rc=$arc），日志：$A_LOG"; tail -40 "$A_LOG" || true; fail "A 失败"; }
-    local A_MET="$A_RUN/eval_model_state_dict/metrics.json"
-    [[ -f "$A_MET" ]] || fail "A 没有产出 metrics.json（$A_MET）"
+    # ⚠️ metrics.json 不在 eval_model_state_dict/ 根下 —— mixture 模式下按 embodiment 分
+    #    子目录（实测 .../eval_model_state_dict/galaxea_r1lite/metrics.json）。
+    #    所以用 find 找，不要写死路径。
+    local A_MET
+    A_MET="$(find "$A_RUN/eval_model_state_dict" -maxdepth 2 -name metrics.json -print -quit 2>/dev/null || true)"
+    [[ -n "$A_MET" && -f "$A_MET" ]] || fail "A 没有产出 metrics.json（在 $A_RUN/eval_model_state_dict 下未找到）"
     ok "A 完成：$A_MET"
 
     # ---------------------------------------------------------------- B：官方基座
-    local B_MET="$B_RUN/eval_model_state_dict/metrics.json"
+    local B_MET=""
     local B_LOG="$logd/eval_B.log"
     if [[ "${EVAL_SKIP_BASE:-0}" == "1" ]]; then
         warn "EVAL_SKIP_BASE=1 —— 跳过基座基线（无法做 A/B 对比）"
@@ -1218,12 +1222,32 @@ do_eval() {
             2>&1 | tee "$B_LOG"
         local brc=${PIPESTATUS[0]}
         set -e
-        if [[ $brc -eq 0 && -f "$B_MET" ]]; then
+        B_MET="$(find "$B_RUN/eval_model_state_dict" -maxdepth 2 -name metrics.json -print -quit 2>/dev/null || true)"
+        if [[ $brc -eq 0 && -n "$B_MET" && -f "$B_MET" ]]; then
             ok "B 完成：$B_MET"
         else
-            warn "B 评测失败（rc=$brc），日志：$B_LOG"
+            warn "B 评测失败或没产出 metrics（rc=$brc），日志：$B_LOG"
             tail -40 "$B_LOG" 2>/dev/null || true
             warn "仍会打印 A 的绝对指标；A/B 对比需修好 B 后再跑"
+        fi
+    fi
+
+    # ---------------------------------------------------------------- 数据规模诊断
+    # 实测踩过：数据集元信息显示 991 条 episode，但评测只加载到 ~27k 帧（约 1 个数据集）
+    # —— 说明混合数据集的加载并不完整。A/B 因为用同一份数据仍然可比，
+    # 但要知道"实际评了多少"，否则数字的含义会被误解。
+    if [[ -f "$A_LOG" ]]; then
+        local a_split a_batches
+        a_split="$(tr -d '\n' < "$A_LOG" | grep -oE 'Split frame range: \[[0-9]+, ?[0-9]+\)' | tail -1 || true)"
+        a_batches="$(grep -oE 'total_dataloader_batches=[0-9]+' "$A_LOG" | tail -1 || true)"
+        info "数据规模诊断（A）：${a_split:-未解析到}   ${a_batches:-}"
+        if [[ -n "$a_batches" ]]; then
+            local nb="${a_batches#*=}"
+            info "  → dataloader 共 $nb 个 batch（×batch_size_val 16 ≈ $((nb * 16)) 帧）"
+            if [[ "$nb" -lt 500 ]]; then
+                warn "  ⚠️ 帧数明显偏少（<8000）：混合数据集可能未完整加载，"
+                warn "     结果只代表【已加载的那部分】；A/B 仍可比，但别当成全量结论"
+            fi
         fi
     fi
 
@@ -1236,7 +1260,9 @@ do_eval() {
         b_tot="$(grep -oE 'out of [0-9]+ total' "$B_LOG" | tail -1 | grep -oE '[0-9]+' || true)"
         info "数据集规模自检： A out-of-total=${a_tot:-?}   B out-of-total=${b_tot:-?}"
         if [[ -n "$a_tot" && -n "$b_tot" && "$a_tot" != "$b_tot" ]]; then
-            fail "A 和 B 评的不是同一份数据集（$a_tot vs $b_tot）—— 对比无意义，已中止"
+            # 降级为 warn：平台日志按 ~80 字符折行，"out of N total" 常被切断，
+            # 解析不可靠。真正的可比性由"两边都用 configs/task/yam.yaml"保证。
+            warn "A/B 解析到的数据集规模不一致（$a_tot vs $b_tot）—— 但可能是日志折行导致的误判，请人工核对"
         elif [[ -n "$a_tot" && "$a_tot" == "$b_tot" ]]; then
             ok "A/B 数据集一致（共 $a_tot 条 episode），对比有效"
         else
