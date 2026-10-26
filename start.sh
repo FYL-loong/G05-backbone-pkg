@@ -1322,11 +1322,63 @@ PYA
     if [[ "${EVAL_UPLOAD:-1}" == "1" ]]; then
         step "5. 上传评测结果到 HF"
         local repo="${HF_REPO_ID:-Zenith6666/yam-backbone}"
-        hf upload "$repo" "$A_MET" "eval/A/metrics.json" --repo-type model \
-            >/dev/null 2>&1 && ok "已上传 eval/A/metrics.json" || warn "A metrics 上传失败"
+        # ⚠️ 绝不能无条件写 eval/A/metrics.json：
+        #    曾出现"只想补可视化、只跑 3 条"的一轮把 eval/A/metrics.json 覆盖成
+        #    3 条的结果，随后拉下来做 A/B 对照时 A 侧口径与 B 侧（10 条）不一致，
+        #    差异从 −89.1% 变成 −88.8%，看起来像模型变了，其实是口径变了。
+        # 做法：按 episode 数分目录存一份（永不互相覆盖），
+        #       再把"完整 A/B 同轮"的结果额外写一份到 eval/{A,B}/metrics.json。
+        hf upload "$repo" "$A_MET" "eval/A/${ne}ep/metrics.json" --repo-type model \
+            >/dev/null 2>&1 && ok "已上传 eval/A/${ne}ep/metrics.json" || warn "A metrics 上传失败"
         if [[ -f "$B_MET" ]]; then
+            hf upload "$repo" "$B_MET" "eval/B/${ne}ep/metrics.json" --repo-type model \
+                >/dev/null 2>&1 && ok "已上传 eval/B/${ne}ep/metrics.json" || warn "B metrics 上传失败"
+        fi
+        if [[ -f "$B_MET" && "${EVAL_SKIP_BASE:-0}" != "1" ]]; then
+            # 只有 A/B 同轮、同 episode 数时，才更新"默认入口"这两个文件
+            hf upload "$repo" "$A_MET" "eval/A/metrics.json" --repo-type model \
+                >/dev/null 2>&1 && ok "已更新 eval/A/metrics.json（A/B 同轮）" || warn "A 默认 metrics 上传失败"
             hf upload "$repo" "$B_MET" "eval/B/metrics.json" --repo-type model \
-                >/dev/null 2>&1 && ok "已上传 eval/B/metrics.json" || warn "B metrics 上传失败"
+                >/dev/null 2>&1 && ok "已更新 eval/B/metrics.json（A/B 同轮）" || warn "B 默认 metrics 上传失败"
+        else
+            info "本轮不是完整 A/B（EVAL_SKIP_BASE=1 或 B 未成功），不动 eval/{A,B}/metrics.json"
+        fi
+        # 附带一份运行信息，便于日后判断"这个 metrics 是哪次跑的"
+        # 用 python 生成 JSON（bash 里手拼引号太容易出错）
+        local info_run="$logd/run_info_${ne}ep.json"
+        .venv/bin/python - "$ne" "$A_LOG" > "$info_run" 2>/dev/null <<'PYRUNINFO' || true
+import datetime, json, os, re, subprocess, sys
+
+ne, alog = sys.argv[1], sys.argv[2]
+batches = None
+try:
+    txt = open(alog, encoding="utf-8", errors="replace").read().replace("\n", "")
+    m = re.findall(r"total_dataloader_batches=(\d+)", txt)
+    batches = int(m[-1]) if m else None
+except Exception:
+    pass
+try:
+    sha = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"],
+                                  text=True, stderr=subprocess.DEVNULL).strip()
+except Exception:
+    sha = None
+json.dump(
+    {
+        "episodes": int(ne) if str(ne).isdigit() else ne,
+        "git_sha": sha,
+        "run_at": datetime.datetime.now(datetime.timezone.utc)
+                          .isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "skip_base": os.environ.get("EVAL_SKIP_BASE", "0"),
+        "total_dataloader_batches": batches,
+        "approx_frames": (batches * 16) if batches else None,
+    },
+    sys.stdout, indent=2, ensure_ascii=False,
+)
+print()
+PYRUNINFO
+        if [[ -s "$info_run" ]]; then
+            hf upload "$repo" "$info_run" "eval/run_info_${ne}ep.json" --repo-type model \
+                >/dev/null 2>&1 && ok "已上传 eval/run_info_${ne}ep.json" || true
         fi
         if [[ "${EVAL_UPLOAD_VIZ:-0}" == "1" ]]; then
             for side in A B; do
