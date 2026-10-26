@@ -360,19 +360,24 @@ do_setup() {
     step "2. 下载权重（约 11.5GB，失败自动重试 3 次）"
     retry 3 60 bash download_weights.sh
 
-    step "3. 下载数据集（失败自动重试 3 次）"
-    if [[ -n "$ONLY_TASK" ]]; then
-        retry 3 60 env ONLY_TASK="$ONLY_TASK" bash download_dataset.sh
+    # SKIP_DATASET=1：跳过数据集下载（MODE=serve-check 不需要数据 —— 它用合成观测）。
+    # 评测（MODE=eval）和训练（MODE=train）必须要有数据集。
+    if [[ "${SKIP_DATASET:-0}" == "1" ]]; then
+        warn "SKIP_DATASET=1 —— 跳过数据集下载（只有 MODE=serve-check 能这么用）"
     else
-        retry 3 60 bash download_dataset.sh
-    fi
+        step "3. 下载数据集（失败自动重试 3 次）"
+        if [[ -n "$ONLY_TASK" ]]; then
+            retry 3 60 env ONLY_TASK="$ONLY_TASK" bash download_dataset.sh
+        else
+            retry 3 60 bash download_dataset.sh
+        fi
 
-    step "4. 数据完整性自检"
-    local n_ds
-    n_ds="$(find data/yam -maxdepth 1 -type d -name 'TASK-YAM-*_lerobot' 2>/dev/null | wc -l | tr -d ' ')"
-    info "发现 $n_ds 个 _lerobot 数据集"
-    [[ "$n_ds" -gt 0 ]] || fail "data/yam 下没有 TASK-YAM-*_lerobot，数据集没拉下来"
-    python - <<'PY'
+        step "4. 数据完整性自检"
+        local n_ds
+        n_ds="$(find data/yam -maxdepth 1 -type d -name 'TASK-YAM-*_lerobot' 2>/dev/null | wc -l | tr -d ' ')"
+        info "发现 $n_ds 个 _lerobot 数据集"
+        [[ "$n_ds" -gt 0 ]] || fail "data/yam 下没有 TASK-YAM-*_lerobot，数据集没拉下来"
+        python - <<'PY'
 import glob, json, os
 dirs = sorted(glob.glob("data/yam/TASK-YAM-*_lerobot"))
 tot = 0
@@ -389,6 +394,7 @@ print(f"       {'合计':30s} episodes={tot}")
 if tot == 0:
     raise SystemExit("[FAIL] 所有数据集 episode 数都是 0，数据有问题")
 PY
+    fi
 
     step "5. stats 自检（维度 + 退化检测）"
     python - <<'PY'
