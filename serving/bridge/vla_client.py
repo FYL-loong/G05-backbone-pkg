@@ -339,10 +339,31 @@ def build_robot():
 
 # ─── main loop ────────────────────────────────────────────────────────────────
 
-async def run(host, port, task, steps, duration, fake_images, mock_robot,
-              camera_cfg, motion_src, max_joint_step_deg, verbose):
+def _ws_connect(uri: str):
+    """``websockets.connect`` with localhost-safe options.
+
+    websockets >= 14 auto-detects HTTP proxy env vars (``ALL_PROXY`` /
+    ``HTTPS_PROXY`` / ``https_proxy``).  This box runs clash-verge, so a plain
+    ``websockets.connect("ws://127.0.0.1:...")`` can be routed through the proxy
+    and fail.  Pass ``proxy=None`` where supported; older websockets reject the
+    kwarg, so fall back without it (same approach as yam_motion/policies/g05.py).
+    """
     import websockets
 
+    kwargs = dict(max_size=None, ping_interval=30, ping_timeout=120,
+                  proxy=None, compression=None)
+    try:
+        return websockets.connect(uri, **kwargs)
+    except TypeError as exc:
+        if "proxy" not in str(exc):
+            raise
+        kwargs.pop("proxy")
+        logger.debug("websockets 不支持 proxy 参数，已回退")
+        return websockets.connect(uri, **kwargs)
+
+
+async def run(host, port, task, steps, duration, fake_images, mock_robot,
+              camera_cfg, motion_src, max_joint_step_deg, verbose):
     period = 1.0 / RATE
     robot = MockRobot() if mock_robot else build_robot()
     limits = np.asarray(robot.get_joint_limits(), dtype=np.float64)
@@ -367,7 +388,7 @@ async def run(host, port, task, steps, duration, fake_images, mock_robot,
 
     t_run0 = time.monotonic()
     try:
-        async with websockets.connect(f"ws://{host}:{port}", max_size=None) as ws:
+        async with _ws_connect(f"ws://{host}:{port}") as ws:
             hello = unpackb(await ws.recv())
             if not isinstance(hello, dict):
                 raise RuntimeError(f"server hello is {type(hello).__name__}, expected dict")

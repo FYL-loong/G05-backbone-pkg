@@ -20,6 +20,14 @@
 | **2** | `--fake-images` 仍会 `build_robot()`，而 `create_pair` **做夹爪标定会真的动机械臂** | 新增 `--mock-robot`；并且**禁止**「合成图 + 真机器人」组合（除非显式 `--allow-fake-images-on-robot`） | 🔴 安全 |
 | **3** | 推理阻塞 ~520 ms 后 `next_tick` 落后，客户端会把缓存步**在几十毫秒内连发**（≈把 0.5 s 轨迹压缩到几十 ms） | 请求耗时 > 1 个周期就 `next_tick = t_got` **重对齐**，停住的时间**丢弃而非补放**（同 `yam_motion.g05_execution.align_chunk` 的思路） | 🔴 会导致剧烈动作 |
 | **4** | `await ws.recv()` 无超时，服务端挂住会永久阻塞且不走清理 | `asyncio.wait_for(..., RECV_TIMEOUT_S=5)`；超时 → `enter_safe_hold` + 退出 | 🟡 安全 |
+| **5** | `websockets.connect(uri, max_size=None)` 直连 —— 但 websockets ≥14 **会自动读 `ALL_PROXY`/`HTTPS_PROXY`**，本机跑着 clash-verge，连 `127.0.0.1` 会被劫持 | 抽出 `_ws_connect()`，显式 `proxy=None, compression=None, ping_interval=30, ping_timeout=120`，老版本不支持 `proxy` 时自动回退 | 🔴 **实测会连不上** |
+
+> **补丁 5 的实测证据**（本地起 WS 服务 + 把 `ALL_PROXY` 指向 `127.0.0.1:1`）：
+> ```
+> ① naive   websockets.connect(uri, max_size=None)  → ConnectionRefusedError（走代理）
+> ② patched vla_client._ws_connect(uri)             → ✅ 直连成功，echo 收到 b'hi'
+> ```
+> `yam_motion/policies/g05.py` 里也显式传了 `proxy=None` —— 同一台机器上踩过的同一个坑。
 
 ### 顺带增强
 
