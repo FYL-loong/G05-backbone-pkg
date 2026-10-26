@@ -1086,16 +1086,75 @@ EOF
 #   EVAL_UPLOAD       1 = 把 metrics.json 上传到 HF（默认 1）
 #   EVAL_UPLOAD_VIZ   1 = 连 episodes/ 可视化一起上传（默认 0，可能几十 MB）
 # ============================================================================
+# ============================================================================
+# prepare_yam_run_dir：把 HF 上我们微调的 4 个产物组装成一个 run 目录。
+#
+# 供 MODE=eval 和 MODE=serve-check 共用（两者都需要同一个 run 目录）。
+# 结果写进全局变量：
+#     PREPARED_RUN_DIR  /  PREPARED_CKPT
+#
+# find_run_dir 会从 ckpt 往上找 5 层内的 .hydra/config.yaml，
+# 所以必须是 <run>/checkpoints/model_state_dict.pt 这个层级。
+#
+# ⚠️ 故意【不】把 action_tokenizer.pt 放进 run 目录：
+#   load_config_from_run_dir 的 _apply_action_tokenizer_sidecar 一旦发现
+#   run_dir/action_tokenizer.pt 存在，就会 OmegaConf.update 三处 ckpt_dir；
+#   而我们的配置里 tokenizer 是【链式插值】(tokenizer: ${tokenizer},
+#   model_arch.action_tokenizer: ${model.tokenizer._target_})，
+#   实测在评测环境里会变成
+#       InterpolationKeyError: 'model.tokenizer._target_' not found
+#   不放这个文件 → sidecar 直接返回 False、零改动；
+#   配置里的 ckpt_dir: checkpoints/action_tokenizer_yam.pt（相对项目根）仍能命中。
+# ============================================================================
+prepare_yam_run_dir() {
+    local run_name="${EVAL_RUN_NAME:-yam-ft-1ep}"
+    local src_repo="${EVAL_SRC_REPO:-Zenith6666/yam-backbone}"
+    PREPARED_RUN_DIR="$PROJECT_ROOT/runs/$run_name"
+    PREPARED_CKPT="$PREPARED_RUN_DIR/checkpoints/model_state_dict.pt"
+
+    if [[ -f "$PREPARED_CKPT" && -f "$PREPARED_RUN_DIR/.hydra/config.yaml" \
+          && -f "$PREPARED_RUN_DIR/dataset_stats.json" \
+          && -f "$PREPARED_RUN_DIR/.hydra/config.yaml.patched" ]]; then
+        ok "run 目录已存在且完整：$PREPARED_RUN_DIR"
+        return 0
+    fi
+
+    step "组装我们微调的 run 目录（$src_repo）"
+    mkdir -p "$PREPARED_RUN_DIR/checkpoints" "$PREPARED_RUN_DIR/.hydra"
+    local tmp="" rc=0
+    tmp="$(mktemp -d)"
+    _hfget() {   # $1=repo 内路径  $2=目标
+        info "下载 $src_repo :: $1"
+        rm -rf "$tmp/dl"; mkdir -p "$tmp/dl"
+        if ! hf download "$src_repo" "$1" --repo-type model --local-dir "$tmp/dl" >/dev/null 2>&1; then
+            warn "hf download 失败：$1"; return 1
+        fi
+        local src="$tmp/dl/$1"
+        [[ -f "$src" ]] || { warn "下载后找不到 $src"; return 1; }
+        mkdir -p "$(dirname "$2")"
+        mv -f "$src" "$2"
+    }
+    _hfget "hydra_config.yaml"     "$PREPARED_RUN_DIR/.hydra/config.yaml" || rc=1
+    _hfget "dataset_stats.json"    "$PREPARED_RUN_DIR/dataset_stats.json" || rc=1
+    _hfget "model_state_dict.pt"   "$PREPARED_CKPT" || rc=1
+    rm -rf "$tmp"
+    [[ $rc -eq 0 ]] || fail "组装 run 目录失败（见上方日志）"
+
+    # 把链式插值就地展开（否则 to_container 会报 InterpolationKeyError）
+    # ⚠️ 用 .venv/bin/python（注意 $PY 只是 do_smoke_ddp 的局部变量，这里不能用）
+    info "展开配置里的链式插值（model.tokenizer / action_tokenizer / AT_CONFIG）..."
+    .venv/bin/python tools/prepare_eval_config.py "$PREPARED_RUN_DIR/.hydra/config.yaml" \
+        --codec-path "checkpoints/action_tokenizer_yam.pt" \
+        || fail "配置展开失败"
+    touch "$PREPARED_RUN_DIR/.hydra/config.yaml.patched"
+    ok "run 目录组装完成：$PREPARED_RUN_DIR"
+}
+
 do_eval() {
     require_hf_token
     activate_venv
 
     local ne="${EVAL_EPISODES:-20}"
-    local run_name="${EVAL_RUN_NAME:-yam-ft-1ep}"
-    local src_repo="${EVAL_SRC_REPO:-Zenith6666/yam-backbone}"
-
-    local A_RUN="$PROJECT_ROOT/runs/$run_name"
-    local A_CKPT="$A_RUN/checkpoints/model_state_dict.pt"
     local B_RUN="$PROJECT_ROOT/checkpoints/g05-base"
     local B_CKPT="$B_RUN/checkpoints/model_state_dict.pt"
 
@@ -1121,53 +1180,9 @@ do_eval() {
     fi
 
     # ---------------------------------------------------------------- 组装 A 的 run 目录
-    # find_run_dir 会从 ckpt 往上找 5 层内的 .hydra/config.yaml，
-    # 所以必须是 <run>/checkpoints/model_state_dict.pt 这个层级。
-    #
-    # ⚠️ 故意【不】把 action_tokenizer.pt 放进 run 目录：
-    #   load_config_from_run_dir 的 _apply_action_tokenizer_sidecar 一旦发现
-    #   run_dir/action_tokenizer.pt 存在，就会 OmegaConf.update 三处 ckpt_dir；
-    #   而我们的配置里 tokenizer 是【链式插值】(tokenizer: ${tokenizer},
-    #   model_arch.action_tokenizer: ${model.tokenizer._target_})，
-    #   实测在评测环境里会变成
-    #       InterpolationKeyError: 'model.tokenizer._target_' not found
-    #   不放这个文件 → sidecar 直接返回 False、零改动；
-    #   配置里的 ckpt_dir: checkpoints/action_tokenizer_yam.pt（相对项目根）仍能命中。
-    if [[ -f "$A_CKPT" && -f "$A_RUN/.hydra/config.yaml" \
-          && -f "$A_RUN/dataset_stats.json" && -f "$A_RUN/.hydra/config.yaml.patched" ]]; then
-        ok "run 目录已存在且完整：$A_RUN"
-    else
-        step "1. 从 HF 组装我们微调的 run 目录（$src_repo）"
-        mkdir -p "$A_RUN/checkpoints" "$A_RUN/.hydra"
-        local tmp="" rc=0
-        tmp="$(mktemp -d)"
-        _hfget() {   # $1=repo 内路径  $2=目标
-            info "下载 $src_repo :: $1"
-            rm -rf "$tmp/dl"; mkdir -p "$tmp/dl"
-            if ! hf download "$src_repo" "$1" --repo-type model --local-dir "$tmp/dl" >/dev/null 2>&1; then
-                warn "hf download 失败：$1"; return 1
-            fi
-            local src="$tmp/dl/$1"
-            [[ -f "$src" ]] || { warn "下载后找不到 $src"; return 1; }
-            mkdir -p "$(dirname "$2")"
-            mv -f "$src" "$2"
-        }
-        _hfget "hydra_config.yaml"     "$A_RUN/.hydra/config.yaml" || rc=1
-        _hfget "dataset_stats.json"    "$A_RUN/dataset_stats.json" || rc=1
-        _hfget "model_state_dict.pt"   "$A_CKPT" || rc=1
-        rm -rf "$tmp"
-        [[ $rc -eq 0 ]] || fail "组装 run 目录失败（见上方日志）"
-
-        # 把链式插值就地展开（否则 to_container 会报 InterpolationKeyError）
-        # ⚠️ 用 .venv/bin/python（activate_venv 之后 python 也可，但显式更稳；
-        #    注意 $PY 只是 do_smoke_ddp 的局部变量，这里不能用）
-        info "展开配置里的链式插值（model.tokenizer / action_tokenizer / AT_CONFIG）..."
-        .venv/bin/python tools/prepare_eval_config.py "$A_RUN/.hydra/config.yaml" \
-            --codec-path "checkpoints/action_tokenizer_yam.pt" \
-            || fail "配置展开失败"
-        touch "$A_RUN/.hydra/config.yaml.patched"
-        ok "run 目录组装完成：$A_RUN"
-    fi
+    prepare_yam_run_dir
+    local A_RUN="$PREPARED_RUN_DIR"
+    local A_CKPT="$PREPARED_CKPT"
 
     # ---------------------------------------------------------------- A：我们的
     step "2. 评测 A（微调 backbone + YAM codec + YAM stats），${ne} 条 episode"
@@ -1417,6 +1432,185 @@ PYRUNINFO
 EOF
 }
 
+# ============================================================================
+# serve-check：离线验证「异步推理服务端」——不接真机、不接 gello_software
+#
+# 回答两个问题（这是能否上真机的最后一道门槛）：
+#   ① T_infer = ? 一次模型推理多久？
+#      判据：必须 <= action_steps / rate = 16/30 = 0.533s（前瞻窗口）
+#      超过 → 每换段会"饿"，机器人会顿一下
+#   ② 服务端链路对不对？(WebSocket + 协议 + chunk 缓存 + 反归一化)
+#
+# 四个子步：
+#   S1  serving/tests 单测（无 GPU，验证 chunked 状态机 / obs 构建 / 编解码）
+#   S2  T_infer 基准（action_steps=1 = RTC 模式，每步都重算 → 每步耗时≈T_infer）
+#   S3  Plan B 时序（action_steps=16 + 30Hz 节拍 → 看换段处是否阻塞、实际能跑多少 Hz）
+#   S4  WebSocket 端到端（起 serve_policy.py + fake_policy_client.py，验证协议）
+#
+# 为什么不做"真实观测 vs GT"的对比：那件事第 4 步（MODE=eval）已经做了 ——
+#   eval 走的是同一个 processor / PolicyInferencer / postprocess 代码路径，
+#   所以归一化、相对转绝对、27→14 维 slot 对齐都已被验证。
+#   这里补的是"网络传输 + chunk 缓存"这一层没有破坏任何东西。
+#
+# 环境变量：
+#   SERVE_ACTION_STEPS    每多少步重算一次，默认 16
+#   SERVE_RATE            控制频率，默认 30
+#   SERVE_PORT            端口，默认 8765
+#   SERVE_TINFER_STEPS    S2 步数，默认 6
+#   SERVE_PLANB_STEPS     S3 步数，默认 48（= 3 个 chunk）
+#   SERVE_WS_STEPS        S4 步数，默认 64
+#   SERVE_SKIP_WS         1 = 跳过 S4
+# ============================================================================
+do_serve_check() {
+    require_hf_token
+    activate_venv
+
+    local logd="$PROJECT_ROOT/serve_logs"
+    mkdir -p "$logd"
+    local asteps="${SERVE_ACTION_STEPS:-16}"
+    local rate="${SERVE_RATE:-30}"
+    local port="${SERVE_PORT:-8765}"
+
+    step "0. 前置检查"
+    [[ -d serving ]] || fail "缺少 serving/ 目录"
+    [[ -x .venv/bin/python ]] || fail "没有 .venv —— 先跑 MODE=setup"
+    .venv/bin/python -c "import websockets" 2>/dev/null || fail "websockets 缺失（应在 pyproject 里）"
+    if ! .venv/bin/python -c "import msgpack" 2>/dev/null; then
+        info "msgpack 不在 venv 里（是间接依赖）—— 补装"
+        uv pip install --python .venv/bin/python msgpack >>"$logd/pip_msgpack.log" 2>&1 \
+            || fail "msgpack 安装失败，见 $logd/pip_msgpack.log"
+    fi
+    ok "依赖就绪（websockets / msgpack）"
+
+    prepare_yam_run_dir
+    local CKPT="$PREPARED_CKPT"
+    ok "ckpt: $CKPT"
+
+    # ---------------------------------------------------------------- S1 单测
+    step "1. serving 单测（无 GPU）"
+    set +e
+    .venv/bin/python -m pytest serving/tests -q 2>&1 | tee "$logd/serve_pytest.log" | tail -12
+    local pytest_rc=${PIPESTATUS[0]}
+    set -e
+    if [[ $pytest_rc -eq 0 ]]; then ok "单测全部通过"; else warn "单测有失败（不阻塞后续，但需排查）"; fi
+
+    # ---------------------------------------------------------------- S2 T_infer
+    step "2. 量 T_infer（action_steps=1 RTC 模式：每步都重算）"
+    local S2="$logd/serve_T_infer.log"
+    local n2="${SERVE_TINFER_STEPS:-6}"
+    info "命令：offline_chunk_harness.py --action_steps 1 --steps $n2 --rate 0"
+    set +e
+    .venv/bin/python serving/offline_chunk_harness.py \
+        --ckpt_path "$CKPT" --device cuda \
+        --action_steps 1 --steps "$n2" --rate 0 2>&1 | tee "$S2" | tail -20
+    local s2rc=${PIPESTATUS[0]}
+    set -e
+    [[ $s2rc -eq 0 ]] || { warn "S2 失败（rc=$s2rc），日志 $S2"; tail -30 "$S2" || true; }
+
+    # ---------------------------------------------------------------- S3 Plan B 时序
+    step "3. Plan B 时序（action_steps=$asteps @ ${rate}Hz：看换段是否阻塞）"
+    local S3="$logd/serve_planb.log"
+    local n3="${SERVE_PLANB_STEPS:-48}"
+    info "命令：offline_chunk_harness.py --action_steps $asteps --steps $n3 --rate $rate"
+    set +e
+    .venv/bin/python serving/offline_chunk_harness.py \
+        --ckpt_path "$CKPT" --device cuda \
+        --action_steps "$asteps" --steps "$n3" --rate "$rate" 2>&1 | tee "$S3" | tail -20
+    local s3rc=${PIPESTATUS[0]}
+    set -e
+    [[ $s3rc -eq 0 ]] || { warn "S3 失败（rc=$s3rc），日志 $S3"; tail -30 "$S3" || true; }
+
+    # ---------------------------------------------------------------- S4 WS 端到端
+    if [[ "${SERVE_SKIP_WS:-0}" == "1" ]]; then
+        warn "SERVE_SKIP_WS=1 —— 跳过 WebSocket 端到端"
+    else
+        step "4. WebSocket 端到端（起服务端 + 合成客户端）"
+        local SRV_LOG="$logd/serve_server.log"
+        local CLI_LOG="$logd/serve_client.log"
+        info "启动 serve_policy.py（host=127.0.0.1 port=$port action_steps=$asteps）"
+        PYTHONUNBUFFERED=1 .venv/bin/python serving/serve_policy.py \
+            --ckpt_path "$CKPT" --host 127.0.0.1 --port "$port" --device cuda \
+            --action_steps "$asteps" > "$SRV_LOG" 2>&1 &
+        local srv=$!
+        local ready=0
+        for _ in $(seq 1 120); do   # 最多等 240 秒（模型加载约 1 分钟）
+            if tr -d '\n' < "$SRV_LOG" 2>/dev/null | grep -q "Policy server listening"; then
+                ready=1; break
+            fi
+            if ! kill -0 "$srv" 2>/dev/null; then break; fi
+            sleep 2
+        done
+        if [[ $ready -eq 1 ]]; then
+            ok "服务端已就绪（ws://127.0.0.1:$port）"
+            set +e
+            .venv/bin/python serving/fake_policy_client.py \
+                --host 127.0.0.1 --port "$port" --rate "$rate" \
+                --steps "${SERVE_WS_STEPS:-64}" --verbose 2>&1 | tee "$CLI_LOG" | tail -25
+            local crc=${PIPESTATUS[0]}
+            set -e
+            if [[ $crc -eq 0 ]]; then ok "S4 通过：WebSocket 链路正常"; else warn "S4 客户端失败（rc=$crc）"; fi
+        else
+            warn "服务端未在 240s 内就绪 —— 见 $SRV_LOG"
+            tail -40 "$SRV_LOG" 2>/dev/null || true
+        fi
+        kill "$srv" 2>/dev/null || true
+        wait "$srv" 2>/dev/null || true
+    fi
+
+    # ---------------------------------------------------------------- 结论
+    step "5. 结论"
+    local t_infer_ms t_avg_ms rate_hz slow_steps
+    t_infer_ms="$(tr -d '\n' < "$S2" 2>/dev/null | grep -oE 'first-step latency \(inference baseline\): *[0-9.]+' | tail -1 | grep -oE '[0-9.]+$' || true)"
+    t_avg_ms="$(tr -d '\n' < "$S2" 2>/dev/null | grep -oE 'latency: avg=[0-9.]+ms' | tail -1 | grep -oE '[0-9.]+' || true)"
+    rate_hz="$(tr -d '\n' < "$S3" 2>/dev/null | grep -oE 'effective_rate=[0-9.]+Hz' | tail -1 | grep -oE '[0-9.]+' || true)"
+    slow_steps="$(tr -d '\n' < "$S3" 2>/dev/null | grep -oE 'slow steps \(>= 20\.0ms, blocked recompute/swap\): \[[^]]*\]' | tail -1 | sed 's/.*: //' || true)"
+
+    local window_ms
+    window_ms="$(awk -v a="$asteps" -v r="$rate" 'BEGIN{printf "%.0f", a*1000.0/r}')"
+
+    echo
+    echo "  ┌──────────────────────────────────────────────────────────┐"
+    printf "  │ T_infer (单次推理)        : %-28s│\n" "${t_infer_ms:-未解析}${t_infer_ms:+ ms}"
+    printf "  │ T_infer 均值(RTC 模式)    : %-28s│\n" "${t_avg_ms:-未解析}${t_avg_ms:+ ms}"
+    printf "  │ 前瞻窗口 (action_steps/Hz): %-28s│\n" "${window_ms} ms  (${asteps}/${rate})"
+    printf "  │ Plan B 实测有效频率        : %-28s│\n" "${rate_hz:-未解析}${rate_hz:+ Hz}"
+    printf "  │ 换段阻塞的 step            : %-28s│\n" "${slow_steps:-未解析}"
+    echo "  └──────────────────────────────────────────────────────────┘"
+    echo
+
+    if [[ -n "$t_infer_ms" ]] && awk -v t="$t_infer_ms" -v w="$window_ms" 'BEGIN{exit !(t<=w)}'; then
+        ok "判定：✅ T_infer (${t_infer_ms}ms) <= 窗口 (${window_ms}ms) —— 异步前瞻能完全藏住推理延迟，实时可行"
+    elif [[ -n "$t_infer_ms" ]]; then
+        local over
+        over="$(awk -v t="$t_infer_ms" -v w="$window_ms" 'BEGIN{printf "%.2f", t/w}')"
+        warn "判定：⚠️ T_infer (${t_infer_ms}ms) 超过窗口 (${window_ms}ms) 约 ${over}×"
+        warn "  → 每 ${asteps} 步会「饿」一下。可选优化（按性价比排序）："
+        warn "    ① 确认 bf16 已开：serve_policy.py:103 读 cfg.model.model_weights_to_bf16（代码默认 True）"
+        warn "       显式开：加 overrides  model.model_weights_to_bf16=true"
+        warn "    ② torch.compile：加 overrides  model.use_torch_compile=true  model.torch_compile_mode=reduce-overhead"
+        warn "       （首次推理会慢几十秒，属正常）"
+        warn "    ③ 降控制频率 SERVE_RATE（如 15Hz → 窗口翻倍）；但 30Hz 是数据原始频率，降频有分布漂移风险"
+        warn "    ④ 调 action_steps 无效来救：lookahead 要求 chunk_len >= 2*action_steps，"
+        warn "       而我们 chunk_len=32、action_steps=16 已恰好是上限"
+    else
+        warn "判定：无法判定 —— S2 没跑出 T_infer，请检查 $S2"
+    fi
+
+    cat <<EOF
+
+  日志位置：
+    S1 单测     : $logd/serve_pytest.log
+    S2 T_infer  : $S2
+    S3 Plan B   : $S3
+    S4 服务端   : $logd/serve_server.log
+    S4 客户端   : $logd/serve_client.log
+
+  ★ 关键判据：T_infer <= ${window_ms}ms（= ${asteps} 步 ÷ ${rate}Hz）
+     满足 → 异步前瞻能完全吸收推理延迟，可以进入真机阶段（还缺 gello_software 的硬件层）
+     不满足 → 先做推理优化，再谈真机
+EOF
+}
+
 # ---------------------------------------------------------------- 分发
 # ⚠️ 必须把 start.sh 收到的额外参数透传给 do_train，否则
 #    `bash start.sh model.max_epochs=1` 会静默失效（用户以为 1 epoch，实际 10 epoch）。
@@ -1426,6 +1620,7 @@ case "$MODE" in
     setup)  do_setup ;;
     verify) do_verify ;;
     eval)   do_eval ;;
+    serve-check) do_serve_check ;;
     train)  do_train "$@" ;;
     all)
         do_setup
