@@ -143,6 +143,24 @@ unpackb = functools.partial(msgpack.unpackb, object_hook=_unpack)
 
 # ─── embodiment schema ───────────────────────────────────────────────────────
 
+# 训练用的 10 个任务的**权威文本**（来自 HF Zenith6666/yam-lerobot 各
+# meta/tasks.parquet 的 index）。模型的条件是这段文本，喂错就等于给错指令，
+# 所以这里内置成表，真机用 --task-id TASK-YAM-0006 即可，免去手打出错。
+TASK_TEXTS = {
+    "TASK-YAM-0001": "Hit the ball with claws to score a goal",
+    "TASK-YAM-0002": "Pick up the seal, dip it in the ink pad, and stamp.",
+    "TASK-YAM-0004": "Grab the ham sausage to the foam box",
+    "TASK-YAM-0006": "Pick up the small square and place it in the groove",
+    "TASK-YAM-0007": "One gripper holds the bottle, and the inner side of the "
+                     "other gripper rubs open the bottle cap.",
+    "TASK-YAM-0008": "One gripper clamps the bottle, and the other gripper "
+                     "rotates to open the cap.",
+    "TASK-YAM-0010": "One gripper holds the gum bottle, and the other gripper "
+                     "pops open the lid.",
+    "TASK-YAM-0013": "Sort the blocks from left to right according to their size.",
+    "TASK-YAM-0014": "Pick up the towel and wipe the whiteboard with it.",
+    "TASK-YAM-0015": "Put items in the drawer.",
+}
 EMBODIMENT_TYPE = "galaxea_r1lite"
 RATE = 30  # Hz — YAM 数据对齐在 30Hz 相机网格上
 
@@ -828,6 +846,22 @@ async def run(args) -> int:
     cameras.start()
     logger.info("cameras: %s", "synthetic zeros" if args.fake_images else args.camera_config)
 
+    # ★ patch 9：相机预热。RealSense 的自动曝光/白平衡要好几帧才收敛 ——
+    #   2026-10-27 实测：head_rgb 均值 77→127 用了一整秒。开头就喂首帧会让模型
+    #   看到"偏暗画面"，与训练分布不符。这里丢弃前 warm 秒的帧，不发指令。
+    warm = float(getattr(args, "camera_warmup_s", 0.0) or 0.0)
+    if warm > 0 and not args.fake_images:
+        t_w = time.monotonic()
+        n_w = 0
+        while time.monotonic() - t_w < warm:
+            try:
+                cameras.sample(time.monotonic())      # 只丢弃，不保存
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("预热期取帧失败（忽略）：%s", exc)
+            n_w += 1
+            time.sleep(1.0 / RATE)
+        logger.info("相机预热完：%.1fs，丢弃 %d 帧（等自动曝光收敛）", warm, n_w)
+
     jump_warn = np.deg2rad(JUMP_WARN_DEG)
     max_step = np.deg2rad(args.max_joint_step_deg) if args.max_joint_step_deg > 0 else 0.0
     latencies: list[float] = []
@@ -896,10 +930,14 @@ def main():
     ap.add_argument("--host", default="127.0.0.1", help="serve_policy host")
     ap.add_argument("--port", type=int, default=18879,
                     help="serve_policy port（本项目 18879；上游默认 8765）")
-    ap.add_argument("--task", required=True,
-                    help="VLM 任务指令 —— 必须与训练文本完全一致。"
-                         "本项目 10 任务模型用："
-                         "'Pick up the small square and place it in the groove'（大写 P）")
+    ap.add_argument("--task", default=None,
+                    help="VLM 任务指令（自由文本）。必须与训练文本完全一致。"
+                         "推荐改用 --task-id 免手打出错")
+    ap.add_argument("--task-id", default=None, metavar="TASK-YAM-XXXX",
+                    help="用内置权威表取任务文本，可选："
+                         + ", ".join(sorted(TASK_TEXTS)))
+    ap.add_argument("--list-tasks", action="store_true",
+                    help="打印内置的 10 个任务文本后退出")
     ap.add_argument("--steps", type=int, default=0, help="步数上限；0 = 不限")
     ap.add_argument("--duration", type=float, default=0.0,
                     help="运行秒数；0 = 不限（与 --steps 0 一起用）")
@@ -934,6 +972,8 @@ def main():
                     help="合成零图（只用于协议冒烟）")
     ap.add_argument("--allow-fake-images-on-robot", action="store_true",
                     help="允许真机 + 合成图（模型会输出乱动作，危险）")
+    ap.add_argument("--camera-warmup-s", type=float, default=1.5,
+                    help="开跑前丢弃前 N 秒相机帧（等自动曝光/白平衡收敛，默认 1.5s）")
     ap.add_argument("--camera-config", default=None,
                     help="含 gello_root/camera_config/camera_names 的 robot.yaml")
     ap.add_argument("--motion-src", default=None,
@@ -961,6 +1001,24 @@ def main():
             except Exception:  # noqa: BLE001
                 pass
 
+    # ---- 解析任务文本（--task-id 优先，内置权威表）----
+    if args.list_tasks:
+        print("  内置权威任务文本（来自 HF Zenith6666/yam-lerobot）：")
+        for k in sorted(TASK_TEXTS):
+            print(f"    {k}  {TASK_TEXTS[k]!r}")
+        return 0
+    if args.task_id:
+        key = args.task_id.strip().upper()
+        if key not in TASK_TEXTS:
+            ap.error(f"未知任务 {args.task_id!r}；可选：{', '.join(sorted(TASK_TEXTS))}")
+        txt = TASK_TEXTS[key]
+        if args.task and args.task.strip() != txt:
+            logger.warning("--task 与 --task-id 冲突，以 --task-id 为准（%r → %r）",
+                           args.task, txt)
+        args.task = txt
+        logger.info("任务文本（--task-id %s）：%r", key, txt)
+    if not args.task:
+        ap.error("必须给 --task 或 --task-id（推荐 --task-id）")
     # ---- 相机只读测试 ----
     if args.camera_test:
         if not args.camera_config or not args.motion_src:
