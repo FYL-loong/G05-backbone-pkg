@@ -698,6 +698,106 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
     return exit_code, step, behind
 
 
+def camera_test(args) -> int:
+    """相机只读测试：开 3 路、采 30 帧、打印形状/均值/耗时。
+
+    ⭐ 全零帧 = 相机没真正出图（或曝光全黑），要单独排查。
+    """
+    cam = RealCameras(args.camera_config, args.motion_src)
+    print(f"  打开相机：{args.camera_config}")
+    cam.start()
+    ok = 0
+    try:
+        for i in range(30):
+            t0 = time.monotonic()
+            out = cam.sample(time.monotonic())
+            dt = (time.monotonic() - t0) * 1e3
+            if out is None:
+                print(f"  [{i:02d}] ❌ 无因果帧 / 帧过旧（>max_frame_age_s）")
+            else:
+                images, ts = out
+                shapes = {k: tuple(v.shape) for k, v in images.items()}
+                means = {k: round(float(v.mean()), 1) for k, v in images.items()}
+                bad = [k for k, v in images.items()
+                       if v.shape != IMAGE_SPECS[k] or v.dtype != np.uint8]
+                if bad:
+                    print(f"  [{i:02d}] ❌ 形状/类型不符：{bad}  {shapes}")
+                else:
+                    ok += 1
+                    print(f"  [{i:02d}] ✅ ts={ts:.3f} means={means} 耗时={dt:.1f}ms")
+            time.sleep(max(0.0, 1.0 / RATE - (time.monotonic() - t0)))
+    finally:
+        cam.close()
+    print(f"\n  通过 {ok}/30 帧")
+    if ok < 25:
+        print("  ❌ 相机不合格（帧率或形状不过关），先修相机再做闭环")
+        return EXIT_CAMERA_STALE
+    print("  ✅ 相机通路正常（注意检查上面的 means 是否非 0 —— 全 0 表示没真出图）")
+    return EXIT_OK
+
+
+def session_test(args) -> int:
+    """安全会话测试：申请会话 → 30Hz 命令到当前位置（≈不动）→ 释放 → 复查状态。
+
+    这是上真机前最关键的一步：验证我们能不能拿到独占控制权、命令能不能下发、
+    释放后守护进程是否确认回到 safe_hold。**全程机械臂只是原地保持**。
+    """
+    robot, backend = make_robot(args.robot_backend, args.mock_robot,
+                                args.robot_host, args.robot_port,
+                                args.safety_port, args.robot_timeout_ms,
+                                args.command_timing)
+    if backend != "zmq":
+        print(f"  ❌ session-test 只支持 zmq 后端（当前 {backend}）")
+        return EXIT_PREFLIGHT
+
+    secs = float(args.session_test)
+    print(f"  会话测试：{secs:.1f}s @ {RATE}Hz，命令到当前实际位置（机械臂不移动）")
+    st0 = robot.status()
+    print(f"  接管前：state={st0.get('state')!r} hold_confirmed={st0.get('hold_confirmed')} "
+          f"stale_clients={st0.get('stale_clients')!r}")
+
+    n = 0
+    t_begin = time.monotonic()
+    rc = EXIT_OK
+    try:
+        with robot.motion_session():
+            print("  ✅ 会话已激活，开始 30Hz 命令当前位置")
+            period = 1.0 / RATE
+            while time.monotonic() - t_begin < secs:
+                robot.check()                       # 心跳线程若故障会在这里抛
+                pos = np.asarray(
+                    robot.get_observations()["joint_positions"],
+                    dtype=np.float32).reshape(-1)
+                robot.command_joint_state(pos)      # 命令到"当前位置" ≈ 不动
+                n += 1
+                time.sleep(period)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ❌ 会话中断：{type(exc).__name__}: {exc}")
+        rc = EXIT_UNHEALTHY
+    finally:
+        dt = time.monotonic() - t_begin
+        try:
+            st1 = robot.status()
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ⚠️ 释放后 status() 失败：{exc}")
+            st1 = {}
+        robot.close(disable_motors=False)
+
+    print(f"\n  命令次数 = {n}   用时 = {dt:.1f}s   有效频率 = {n / dt if dt else 0:.1f} Hz")
+    print(f"  释放后：state={st1.get('state')!r} hold_confirmed={st1.get('hold_confirmed')} "
+          f"reason={str(st1.get('reason'))[:80]!r}")
+    if st1.get("state") != "safe_hold":
+        print("  ❌ 释放后没有回到 safe_hold —— 手动确认机器人状态！")
+        return EXIT_UNHEALTHY
+    if not st1.get("hold_confirmed"):
+        print("  ⚠️ safe_hold 但 hold_confirmed 不是 True，再查一次")
+    if n < secs * RATE * 0.85:
+        print(f"  ⚠️ 命令频率偏低（{n / dt:.1f}Hz，期望 ~{RATE}）")
+        return EXIT_UNHEALTHY
+    print("  ✅ 会话测试通过：能接管、能下发、释放后回到 safe_hold")
+    return rc
+
+
 async def run(args) -> int:
     robot, backend = make_robot(args.robot_backend, args.mock_robot,
                                 args.robot_host, args.robot_port,
@@ -813,6 +913,11 @@ def main():
                     help="与部署包 runtime.yaml 的 command_timing 对齐")
     ap.add_argument("--check-robot", action="store_true",
                     help="只读探测：打印机器人/安全守护状态后退出，不发任何指令")
+    ap.add_argument("--session-test", type=float, default=0.0, metavar="SECONDS",
+                    help="安全会话测试：申请会话→30Hz 命令到当前位置（机械臂不移动）→"
+                         "释放→复查 safe_hold。上真机前的关键一步")
+    ap.add_argument("--camera-test", action="store_true",
+                    help="相机只读测试：开 3 路、采 30 帧、打印形状/均值/耗时")
 
     # 相机
     ap.add_argument("--fake-images", action="store_true",
@@ -845,6 +950,16 @@ def main():
                 robot.close(disable_motors=False)
             except Exception:  # noqa: BLE001
                 pass
+
+    # ---- 相机只读测试 ----
+    if args.camera_test:
+        if not args.camera_config or not args.motion_src:
+            ap.error("--camera-test 需要 --camera-config 和 --motion-src")
+        return sys.exit(camera_test(args))
+
+    # ---- 安全会话测试（上真机前最关键的一步）----
+    if args.session_test > 0:
+        return sys.exit(session_test(args))
 
     # ---- 防护 ----
     if args.fake_images and not args.mock_robot and not args.allow_fake_images_on_robot:
