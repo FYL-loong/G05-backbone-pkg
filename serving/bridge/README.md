@@ -9,18 +9,22 @@
 
 | 文件 | 来源 |
 |---|---|
-| `vla_client.py` | **张恩同原作**（实验机 `g05-yam-deployment/bridge/vla_client.py`，2026-10-26）+ 我们打的 **4 个补丁** |
+| `vla_client.py` | **张恩同原作**（实验机 `g05-yam-deployment/bridge/vla_client.py`，2026-10-26）+ 我们打的 **8 个补丁** |
 | `test_vla_client.py` | 我们补的纯函数自测（10 项，无需 gello / 相机 / GPU） |
+| `smoke_test.sh` | 一键端到端冒烟（起服务端 → fake client → 我们的 bridge → 自动收尾） |
 
-### 打过的 4 个补丁
+### 打过的 8 个补丁
 
 | # | 原问题 | 修法 | 严重性 |
 |---|---|---|---|
 | **1** | `capture_images()` 是 `NotImplementedError`，真机必崩 | 复用 `yam_motion.cameras.YamCameras`（已验证：**只取 host_ts ≤ 查询时刻的因果帧**，超 `max_age_s` 拒绝） | 🔴 阻塞 |
 | **2** | `--fake-images` 仍会 `build_robot()`，而 `create_pair` **做夹爪标定会真的动机械臂** | 新增 `--mock-robot`；并且**禁止**「合成图 + 真机器人」组合（除非显式 `--allow-fake-images-on-robot`） | 🔴 安全 |
 | **3** | 推理阻塞 ~520 ms 后 `next_tick` 落后，客户端会把缓存步**在几十毫秒内连发**（≈把 0.5 s 轨迹压缩到几十 ms） | 请求耗时 > 1 个周期就 `next_tick = t_got` **重对齐**，停住的时间**丢弃而非补放**（同 `yam_motion.g05_execution.align_chunk` 的思路） | 🔴 会导致剧烈动作 |
-| **4** | `await ws.recv()` 无超时，服务端挂住会永久阻塞且不走清理 | `asyncio.wait_for(..., RECV_TIMEOUT_S=5)`；超时 → `enter_safe_hold` + 退出 | 🟡 安全 |
+| **4** | `await ws.recv()` 无超时，服务端挂住会永久阻塞且不走清理 | `asyncio.wait_for(...)`；超时 → `enter_safe_hold` + 退出 | 🟡 安全 |
 | **5** | `websockets.connect(uri, max_size=None)` 直连 —— 但 websockets ≥14 **会自动读 `ALL_PROXY`/`HTTPS_PROXY`**，本机跑着 clash-verge，连 `127.0.0.1` 会被劫持 | 抽出 `_ws_connect()`，显式 `proxy=None, compression=None, ping_interval=30, ping_timeout=120`，老版本不支持 `proxy` 时自动回退 | 🔴 **实测会连不上** |
+| **6** | 统一 5 s 收包超时，**把首次推理掐死** —— 首次 forward 含 CUDA kernel autotune，实测 ~12 s | 首包 `FIRST_RECV_TIMEOUT_S=180`，稳态 `RECV_TIMEOUT_S=10` | 🔴 实测误触发 safe hold |
+| **7** | 安全停机却返回 **退出码 0**，上层脚本把中断误判成成功 | 安全停机返回非零：2=机器人异常 / 3=服务端错误 / 4=收包超时 / 5=相机丢帧 / 6=preflight 失败 | 🟡 自动化判据 |
+| **8** | `build_robot()` 直连 CAN：**抢守护进程的 CAN 总线、没有 400 ms 看门狗、没有软限位** | 新增 `--robot-backend {zmq,direct,mock}`。`zmq`（默认）走 `ZMQClientRobot`(:6001) + `SafetyClient`(:6002) + `SupervisedMotionSession`；`direct` 保留原 `create_pair` 路径供调试 | 🔴 真机安全 |
 
 > **补丁 5 的实测证据**（本地起 WS 服务 + 把 `ALL_PROXY` 指向 `127.0.0.1:1`）：
 > ```
@@ -99,25 +103,62 @@ $V bridge/vla_client.py --host 127.0.0.1 --port 18879 \
 
 ## 4. 真机运行（先确认急停可用）
 
+### 4.0 先只读探测（**不改变任何状态**，别人正在用时也能跑）
+
+```bash
+$V bridge/vla_client.py --task x --check-robot
+```
+
+期望：
+```
+  backend      = zmq
+  safety.state = 'safe_hold'
+  stale_clients= [...]
+  ✅ 处于 safe_hold，可以申请会话接管。
+```
+若 `state='active'` → **正被别人控制，不要接管**（返回码 6）。
+
+### 4.1 走安全守护进程（推荐）
+
 ```bash
 $V bridge/vla_client.py --host 127.0.0.1 --port 18879 \
     --task "Pick up the small square and place it in the groove" \
+    --robot-backend zmq --robot-port 6001 --safety-port 6002 \
+    --command-timing legacy_30hz \
     --camera-config <deploy>/live_configs/robot.yaml \
     --motion-src    <deploy>/code/motion/src \
     --duration 20
 ```
 
-- `--camera-config` 指向含 `gello_root / camera_config / camera_names` 的 robot.yaml
-  （本项目即 `live_configs/robot.yaml`）
-- 相机名映射：`main→head_rgb`、`left→left_wrist_rgb`、`right→right_wrist_rgb`，
-  HWC `(480,640,3)` → CHW `(3,480,640)`
+会话生命周期（由 `SupervisedMotionSession` 保证）：
 
-**安全边界**：机器人不健康 / 服务端 `error` / 收包超时 / Ctrl+C
-→ 一律 `enter_safe_hold()` 后 `close(disable_motors=True)`；
-命令后按 `get_joint_limits()` 裁剪（每臂 6×2 + 夹爪 [0,1]）。
+```
+preflight: state 必须 == 'safe_hold' 且 stale_clients 非空
+  ↓
+begin_session + 起 parent/collector 两个 200ms 心跳线程
+  ↓
+等待 stale_clients 变空 → 自动 activate()（safe_hold → active）
+  ↓
+主循环：每步 session.check()（心跳线程发现 fault/disarmed 立刻抛）
+  ↓
+退出：hold() → 守护进程确认 SAFE HOLD → 关连接
+```
 
-⚠️ `build_robot()` 里 `create_pair` 会**做夹爪标定并移动机械臂** —— 上真机前务必确认
-急停和安全守护（`gello.safety`，400 ms watchdog，6002 端口）可用。
+守护进程端有 **400 ms 看门狗**：我们的两个心跳线程只要 200 ms 内没发心跳，
+守护进程自动抱死 —— 我们的进程被 kill -9 也不会留下失控的机械臂。
+
+### 4.2 直连 CAN（仅调试，独占总线、无看门狗）
+
+```bash
+$V bridge/vla_client.py --task "..." --robot-backend direct ...
+```
+
+⚠️ 会做夹爪标定、**会真动机器人**，且与守护进程抢 CAN。只有守护进程停掉时才可用。
+
+**安全边界**：机器人不健康 / 后端 check 抛错 / 服务端 `error` / 收包超时 / 相机丢帧
+→ 一律 `enter_safe_hold()` 后 `close(disable_motors=True)`，并以非零码退出。
+zmq 模式下本地不做裁剪（**软限位由守护进程执行**）；direct 模式按
+`get_joint_limits()` 裁剪（每臂 6×2 + 夹爪 [0,1]）。
 
 ---
 

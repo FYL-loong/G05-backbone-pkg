@@ -37,31 +37,79 @@ TASK="${TASK:-Pick up the small square and place it in the groove}"
 
 export PYTHONDONTWRITEBYTECODE=1
 
+# ---------------------------------------------------------------- 网络通路
+# 本机实测（2026-10-27）：
+#   直连 huggingface.co        → 超时
+#   走 clash 7890 / 7891 代理   → error:0A000126 SSL routines::unexpected eof
+#   直连 hf-mirror.com         → ✅ 可用
+# ⇒ 默认清空代理变量并指向 hf-mirror；如需回到官方站，用 HF_ENDPOINT=https://huggingface.co KEEP_PROXY=1
+if [[ "${KEEP_PROXY:-0}" != "1" ]]; then
+    unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy 2>/dev/null || true
+fi
+export NO_PROXY="${NO_PROXY:-}${NO_PROXY:+,}huggingface.co,hf-mirror.com,cdn-lfs.huggingface.co,cdn-lfs.hf.co"
+export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+
 fail() { echo -e "\n[FAIL] $*" >&2; exit 1; }
 info() { echo -e "\n[INFO] $*"; }
 ok()   { echo "[ OK ] $*"; }
+
+info "0a 网络通路"
+echo "  HF_ENDPOINT = $HF_ENDPOINT"
+echo "  NO_PROXY    = $NO_PROXY"
+echo "  HTTPS_PROXY = ${HTTPS_PROXY:-<已清空>}"
+echo "  KEEP_PROXY  = ${KEEP_PROXY:-0}"
 
 # ---------------------------------------------------------------- 0 前置检查
 info "0/5 前置检查"
 [[ -n "${HF_TOKEN:-}" ]] || fail "请先： export HF_TOKEN=hf_你的token"
 [[ -d "$SRC" ]] || fail "找不到骨架包 SRC=$SRC"
 [[ -f "$SRC/launch.sh" ]] || fail "$SRC/launch.sh 不存在"
-[[ -e "$DEST" ]] && fail "$DEST 已存在。确认无用后： rm -rf $DEST"
-python3 -c "import yaml" 2>/dev/null || fail "python3 缺 pyyaml"
-
-# 自动探测 hf CLI（这台机器上 hf 不在 PATH）
-HF="${HF_CLI:-}"
-if [[ -z "$HF" ]]; then
-    if command -v hf >/dev/null 2>&1; then
-        HF="$(command -v hf)"
-    elif [[ -x "$SRC/runtime/env/bin/hf" ]]; then
-        HF="$SRC/runtime/env/bin/hf"
+# DEST 处理：允许"上次中断"的目录继续跑（网络抖动时不用删重来）
+RESUME=0
+if [[ -e "$DEST" ]]; then
+    if [[ -f "$DEST/.build_partial" ]]; then
+        RESUME=1
+        echo "[WARN] 检测到上次中断的构建（存在 .build_partial），继续执行，骨架不重复复制"
     else
-        fail "找不到 hf CLI，请设置 HF_CLI=<path>"
+        fail "$DEST 已存在且不是中断的构建。确认无用后： rm -rf $DEST"
     fi
 fi
-[[ -x "$HF" ]] || fail "hf 不可执行：$HF"
-ok "hf: $HF"
+python3 -c "import yaml" 2>/dev/null || fail "python3 缺 pyyaml"
+
+# ---------------------------------------------------------------- HF 下载器
+# ⚠️ 不用 `hf` CLI：这台机器上 runtime/env/bin/hf 的 shebang 指向 compute 机的
+#    /mnt/pfs/.../bin/python，搬到 yam1 后是 bad interpreter。
+#    直接用 python API（snapshot_download），版本无关且支持 HF_ENDPOINT。
+PY="${PY:-$SRC/runtime/env/bin/python}"
+[[ -x "$PY" ]] || fail "找不到 python：$PY（可用 PY=<path> 覆盖）"
+"$PY" -c "import huggingface_hub" 2>/dev/null || fail "$PY 里没有 huggingface_hub"
+ok "python: $PY"
+
+hfd() {  # $1=repo  $2=local_dir  $3..=allow_patterns
+    local repo="$1" dest="$2"; shift 2
+    "$PY" - "$repo" "$dest" "$@" <<'PYDL' || return 1
+import os, sys
+from huggingface_hub import snapshot_download
+repo, dest, pats = sys.argv[1], sys.argv[2], sys.argv[3:]
+print(f"  [hf] {repo} -> {dest}")
+print(f"  [hf] patterns={pats}")
+print(f"  [hf] HF_ENDPOINT={os.environ.get('HF_ENDPOINT', '(default)')}", flush=True)
+snapshot_download(repo_id=repo, repo_type="model", allow_patterns=pats,
+                  local_dir=dest)
+print("  [hf] done", flush=True)
+PYDL
+}
+
+# 连通性预检：能拿到 dataset_stats.json 的元信息就算通
+info "HF 连通性预检（$REPO）"
+"$PY" - "$REPO" <<'PYCHK' || fail "HF 不可达 —— 换 HF_ENDPOINT 或改用本地下载+scp"
+import sys
+from huggingface_hub import HfApi
+api = HfApi()
+info = api.model_info(sys.argv[1], files_metadata=False)
+print(f"  ✅ 可达：{info.id}  (private={info.private})")
+PYCHK
+ok "HF 可达"
 
 df -h /mnt/sda | tail -1
 AVAIL_G=$(df -BG --output=avail /mnt/sda | tail -1 | tr -dc '0-9')
@@ -70,39 +118,101 @@ mkdir -p "$HF_HOME" "$HFDIR"
 ok "前置检查通过（/mnt/sda 可用 ${AVAIL_G}G）"
 
 # ---------------------------------------------------------------- 1 复制骨架
-info "1/5 复制部署骨架（code / runtime / live_configs / 元数据）"
-mkdir -p "$DEST"/models/ar_ft1ep/checkpoints "$DEST"/models/ar_ft1ep/.hydra \
-         "$DEST"/logs "$DEST"/reports
-cp -a "$SRC/code"              "$DEST/code"
-cp -a "$SRC/runtime"           "$DEST/runtime"
-cp -a "$SRC/live_configs"      "$DEST/live_configs"
-cp -a "$SRC/launch.sh"         "$DEST/launch.sh"
-cp -a "$SRC/verify_offline.py" "$DEST/verify_offline.py"
-for f in motion_contract.json motion_package.json motion_experiment.json \
-         motion_versions.json motion_split.json; do
-    [[ -f "$SRC/models/ar_newcodec5000/$f" ]] && \
-        cp -a "$SRC/models/ar_newcodec5000/$f" "$DEST/models/ar_ft1ep/$f"
-done
-ok "骨架复制完成，当前大小：$(du -sh "$DEST" | cut -f1)"
+if [[ $RESUME -eq 0 ]]; then
+    info "1/5 复制部署骨架（code / runtime / live_configs / 元数据）"
+    mkdir -p "$DEST"/models/ar_ft1ep/checkpoints "$DEST"/models/ar_ft1ep/.hydra \
+             "$DEST"/logs "$DEST"/reports
+    cp -a "$SRC/code"              "$DEST/code"
+    cp -a "$SRC/runtime"           "$DEST/runtime"
+    cp -a "$SRC/live_configs"      "$DEST/live_configs"
+    cp -a "$SRC/launch.sh"         "$DEST/launch.sh"
+    cp -a "$SRC/verify_offline.py" "$DEST/verify_offline.py"
+    for f in motion_contract.json motion_package.json motion_experiment.json \
+             motion_versions.json motion_split.json; do
+        [[ -f "$SRC/models/ar_newcodec5000/$f" ]] && \
+            cp -a "$SRC/models/ar_newcodec5000/$f" "$DEST/models/ar_ft1ep/$f"
+    done
+    # 官方 processor：我们的 HF 仓库没有 hf_processor/，用骨架包自带那份
+    # （同为 qwen3_5_2b_base_processor，词表一致）
+    cp -a "$SRC/models/ar_newcodec5000/hf_processor" "$DEST/models/ar_ft1ep/hf_processor"
+    touch "$DEST/.build_partial"
+    ok "骨架复制完成，当前大小：$(du -sh "$DEST" | cut -f1)"
+else
+    # 中断续跑：只补缺失的骨架文件
+    info "1/5（续跑）检查骨架完整性"
+    mkdir -p "$DEST"/models/ar_ft1ep/checkpoints "$DEST"/models/ar_ft1ep/.hydra \
+             "$DEST"/logs "$DEST"/reports
+    for d in code runtime live_configs; do
+        [[ -d "$DEST/$d" ]] || cp -a "$SRC/$d" "$DEST/$d"
+    done
+    for f in launch.sh verify_offline.py; do
+        [[ -f "$DEST/$f" ]] || cp -a "$SRC/$f" "$DEST/$f"
+    done
+    for f in motion_contract.json motion_package.json motion_experiment.json \
+             motion_versions.json motion_split.json; do
+        [[ -f "$DEST/models/ar_ft1ep/$f" ]] || \
+            { [[ -f "$SRC/models/ar_newcodec5000/$f" ]] && \
+              cp -a "$SRC/models/ar_newcodec5000/$f" "$DEST/models/ar_ft1ep/$f"; }
+    done
+    [[ -d "$DEST/models/ar_ft1ep/hf_processor" ]] || \
+        cp -a "$SRC/models/ar_newcodec5000/hf_processor" "$DEST/models/ar_ft1ep/hf_processor"
+    ok "骨架完整（续跑）"
+fi
 
 # ---------------------------------------------------------------- 2 下载产物
-info "2/5 从 HF 拉我们的训练产物（约 11.6G，慢一点）"
-"$HF" download "$REPO" --repo-type model --local-dir "$HFDIR/$REPO" \
-    --include "model_state_dict.pt" --include "dataset_stats.json" \
-    --include "hydra_config.yaml"   --include "action_tokenizer.pt" \
-    --include "hf_processor/*" || fail "我们的模型产物下载失败"
-"$HF" download "$CODEC_REPO" --repo-type model --local-dir "$HFDIR/$CODEC_REPO" \
-    --include "yam_stats.json" || fail "codec stats（yam_stats.json）下载失败"
+# 两种模式：
+#   在线（默认）  —— 用 python snapshot_download 从 HF（hf-mirror）拉 11.6G
+#   离线 LOCAL_HF —— 产物已在本地目录（先在自己电脑下好、再拖到机器上），
+#                    完全不联网。目录布局（扁平）：
+#                      $LOCAL_HF/model_state_dict.pt
+#                      $LOCAL_HF/dataset_stats.json
+#                      $LOCAL_HF/hydra_config.yaml
+#                      $LOCAL_HF/action_tokenizer.pt
+#                      $LOCAL_HF/yam_stats.json
+#                    （不含 hf_processor：我们的 HF 仓库没有，用骨架包自带的）
+if [[ -n "${LOCAL_HF:-}" ]]; then
+    info "2/5 使用本地产物目录（LOCAL_HF=$LOCAL_HF），不走网络"
+    [[ -d "$LOCAL_HF" ]] || fail "LOCAL_HF 不存在：$LOCAL_HF"
+    # 注意：不含 hf_processor —— 我们的 HF 仓库没有它，官方 processor 用骨架包里的
+    need=(model_state_dict.pt dataset_stats.json hydra_config.yaml \
+          action_tokenizer.pt yam_stats.json)
+    for x in "${need[@]}"; do
+        [[ -e "$LOCAL_HF/$x" ]] || fail "缺少 $LOCAL_HF/$x"
+    done
+    ok "本地产物齐全（5 项；hf_processor 用骨架包自带那份）"
+    M_TMP="$LOCAL_HF"
+else
+    info "2/5 从 HF 拉我们的训练产物（约 10.8 GiB，慢一点）"
+    # 注意：不下载 hf_processor —— 我们的 HF 仓库里【没有】这个目录
+    #      （根下只有 checkpoints/、eval/、logs/ 三个目录 + 6 个文件）。
+    #      官方 processor 由第 1 步从骨架包复制。
+    hfd "$REPO" "$HFDIR/$REPO" \
+        "model_state_dict.pt" "dataset_stats.json" "hydra_config.yaml" \
+        "action_tokenizer.pt" \
+        || fail "我们的模型产物下载失败"
+    hfd "$CODEC_REPO" "$HFDIR/$CODEC_REPO" "yam_stats.json" \
+        || fail "codec stats（yam_stats.json）下载失败"
+    M_TMP="$HFDIR/$REPO"
+fi
 
 M="$DEST/models/ar_ft1ep"
-mv -f "$HFDIR/$REPO/model_state_dict.pt"  "$M/checkpoints/model_state_dict.pt"
-mv -f "$HFDIR/$REPO/dataset_stats.json"   "$M/dataset_stats.json"
-mv -f "$HFDIR/$REPO/action_tokenizer.pt"  "$M/action_tokenizer.pt"
-mv -f "$HFDIR/$REPO/hydra_config.yaml"    "$M/.hydra/config.yaml"
-rm -rf "$M/hf_processor"
-mv -f "$HFDIR/$REPO/hf_processor"         "$M/hf_processor"
-mv -f "$HFDIR/$CODEC_REPO/yam_stats.json" "$M/ar_codec_stats.json"
-rm -rf "$HFDIR"
+if [[ -n "${LOCAL_HF:-}" ]]; then
+    # 离线：复制（保留源文件，便于重复构建）
+    cp -f  "$M_TMP/model_state_dict.pt" "$M/checkpoints/model_state_dict.pt"
+    cp -f  "$M_TMP/dataset_stats.json"  "$M/dataset_stats.json"
+    cp -f  "$M_TMP/action_tokenizer.pt" "$M/action_tokenizer.pt"
+    cp -f  "$M_TMP/hydra_config.yaml"   "$M/.hydra/config.yaml"
+    cp -f  "$M_TMP/yam_stats.json"      "$M/ar_codec_stats.json"
+    # hf_processor 已在第 1 步从骨架包复制，这里不动
+else
+    mv -f "$M_TMP/model_state_dict.pt"  "$M/checkpoints/model_state_dict.pt"
+    mv -f "$M_TMP/dataset_stats.json"   "$M/dataset_stats.json"
+    mv -f "$M_TMP/action_tokenizer.pt"  "$M/action_tokenizer.pt"
+    mv -f "$M_TMP/hydra_config.yaml"    "$M/.hydra/config.yaml"
+    # hf_processor 已在第 1 步从骨架包复制，这里不动
+    mv -f "$HFDIR/$CODEC_REPO/yam_stats.json" "$M/ar_codec_stats.json"
+    rm -rf "$HFDIR"
+fi
 
 check_size() {  # $1=path $2=expected bytes
     local got; got=$(stat -c%s "$1")
@@ -281,6 +391,7 @@ print('    port / uri  =', d['g05']['port'], d['g05']['uri'])
 print('    action_steps=', d['g05']['action_steps'], ' full_chunk =', d['g05']['full_chunk'])
 "
 echo
+rm -f "$DEST/.build_partial"
 ok "全部完成 ✅  部署包：$DEST  ($(du -sh "$DEST" | cut -f1))"
 cat <<EOF
 
