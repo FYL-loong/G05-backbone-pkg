@@ -216,12 +216,17 @@ def stop_server(proc) -> None:
 
 
 # ─── 统计 ────────────────────────────────────────────────────────────────────
-def col_corr(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """逐列皮尔逊相关；常数列为 nan。"""
+def col_corr(a: np.ndarray, b: np.ndarray, min_std: float = 0.01) -> np.ndarray:
+    """逐列皮尔逊相关。
+
+    ``min_std`` 以下视为**静态维**返回 nan —— 在 0.001 rad 的噪声上算相关性
+    毫无意义（那次真实会话里左臂 6 维 std 只有 ~0.001 rad），否则会随机
+    出现 ≈0 或负相关，把"静态"误判成"关节顺序错"。
+    """
     out = np.full(a.shape[1], np.nan, dtype=np.float64)
     for j in range(a.shape[1]):
         x, y = a[:, j].astype(np.float64), b[:, j].astype(np.float64)
-        if x.std() < 1e-9 or y.std() < 1e-9:
+        if x.std() < min_std or y.std() < min_std:
             continue
         out[j] = float(np.corrcoef(x, y)[0, 1])
     return out
@@ -243,31 +248,41 @@ def compute_stats(ours: np.ndarray, ref: np.ndarray, state: np.ndarray,
     return {
         "n": int(ours.shape[0]),
         "corr_ref": col_corr(ours, ref),          # 与 AR5k 动作的相关性
-        "corr_dstate": col_corr(step_ours, dstate),  # 动作增量与真实状态变化
+        "corr_dstate": col_corr(step_ours, dstate, min_std=0.005),  # 每步位移很小，门槛放低
         "rms_ratio": rms_ratio(ours, ref),
         "abs_step": np.abs(step_ours),
         "abs_ref_step": np.abs(ref - state),
+        "std_ours": ours.std(axis=0),
+        "std_ref": ref.std(axis=0),
+        "std_state": state.std(axis=0),
     }
 
 
 def print_report(ours, ref, state, dstate, stats, dim_names) -> int:
     n = stats["n"]
-    print("\n" + "=" * 96)
+    print("\n" + "=" * 104)
     print(f"  逐维统计（{n} 个采样；ref = 日志里 AR5k 的 predicted_actions[0]）")
-    print("=" * 96)
-    hdr = f"  {'dim':<16}{'corr(ours,ref)':>16}{'corr(Δstate)':>15}" \
-          f"{'|ours-state| p50':>19}{'p95':>10}{'|ref-state| p50':>18}"
-    print(hdr)
-    print("  " + "-" * 92)
+    print("=" * 104)
+    print(f"  {'dim':<10}{'std(state)':>12}{'std(ours)':>11}{'std(ref)':>10}"
+          f"{'corr(ours,ref)':>16}{'corr(Δstate)':>14}"
+          f"{'|ours-st| p50':>15}{'p95':>9}{'|ref-st| p50':>14}")
+    print("  " + "-" * 100)
     for j, name in enumerate(dim_names):
         cr = stats["corr_ref"][j]
         cd = stats["corr_dstate"][j]
         p50 = float(np.percentile(stats["abs_step"][:, j], 50))
         p95 = float(np.percentile(stats["abs_step"][:, j], 95))
         r50 = float(np.percentile(stats["abs_ref_step"][:, j], 50))
-        print(f"  {name:<16}{('nan' if np.isnan(cr) else f'{cr:+.3f}'):>16}"
-              f"{('nan' if np.isnan(cd) else f'{cd:+.3f}'):>15}"
-              f"{p50:>19.4f}{p95:>10.4f}{r50:>18.4f}")
+        flag = " 靜" if np.isnan(cr) else ""
+        print(f"  {name:<10}{stats['std_state'][j]:>12.5f}{stats['std_ours'][j]:>11.5f}"
+              f"{stats['std_ref'][j]:>10.5f}"
+              f"{('static' if np.isnan(cr) else f'{cr:+.3f}'):>16}"
+              f"{('static' if np.isnan(cd) else f'{cd:+.3f}'):>14}"
+              f"{p50:>15.4f}{p95:>9.4f}{r50:>14.4f}{flag}")
+    n_static = int(np.sum(np.isnan(stats["corr_ref"])))
+    if n_static:
+        print(f"  （{n_static} 维标记 static：标准差 < 0.01 rad，在这些维上算相关性没有意义，"
+              f"不参与判定）")
 
     print("\n" + "=" * 96)
     print("  判定")
@@ -277,24 +292,32 @@ def print_report(ours, ref, state, dstate, stats, dim_names) -> int:
 
     cr = stats["corr_ref"]
     valid = ~np.isnan(cr)
+    # 夹爪豁免"相关度≈0"硬判据：日志里 AR5k 的右夹爪是退化的（全程 0.0，后期跳到 1.0），
+    # 拿它当参照必然对不上，与本项目映射正确性无关。夹爪由 check_limits 单独把关。
+    GRIP_EXEMPT = {"L_grip", "R_grip"}
     neg = [dim_names[j] for j in range(len(cr))
-           if valid[j] and cr[j] < -0.2]
+           if valid[j] and cr[j] < -0.2 and dim_names[j] not in GRIP_EXEMPT]
     # ★ 顺序/映射错的典型特征是"相关度≈0"，必须当硬失败（否则单向 swap 会被放过）
     dead = [dim_names[j] for j in range(len(cr))
-            if valid[j] and cr[j] < 0.1]
+            if valid[j] and cr[j] < 0.1 and dim_names[j] not in GRIP_EXEMPT]
     weak = [dim_names[j] for j in range(len(cr))
-            if valid[j] and 0.1 <= cr[j] < 0.35]
+            if valid[j] and 0.1 <= cr[j] < 0.35 and dim_names[j] not in GRIP_EXEMPT]
+    grip_corr = {dim_names[j]: (None if not valid[j] else round(float(cr[j]), 3))
+                 for j in range(len(cr)) if dim_names[j] in GRIP_EXEMPT}
 
     if neg:
         fails.append(f"❌ 符号翻转（负相关）：{neg}")
     if dead:
         fails.append(f"❌ 相关度≈0（疑似关节顺序/映射错）：{dead}")
     if not neg and not dead:
-        print("  ✅ 无符号翻转、无相关度≈0 的维度")
+        print("  ✅ 无符号翻转、无相关度≈0 的维度（臂关节）")
     if weak:
         warns.append(f"🟡 相关偏弱：{weak}（若该维在数据里近似常数可忽略）")
     if not weak:
-        print(f"  ✅ 全部 {int(valid.sum())}/{len(cr)} 有效维与 ref 相关 > 0.35")
+        print(f"  ✅ 全部 {int(valid.sum()) - sum(1 for k, v in grip_corr.items() if v is not None)}"
+              f" 个有效臂关节维与 ref 相关 > 0.35")
+    if grip_corr:
+        print(f"  ℹ️ 夹爪与 AR5k 的相关性（仅供参考，AR5k 夹爪本身退化）：{grip_corr}")
 
     rr = stats["rms_ratio"]
     if not (0.5 <= rr <= 2.0):
