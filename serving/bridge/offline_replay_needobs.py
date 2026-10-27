@@ -396,6 +396,7 @@ async def replay(args, vc) -> int:
     rng = np.random.default_rng(args.seed)
     n = min(args.samples, len(queries))
     pick = sorted(rng.choice(len(queries), size=n, replace=False).tolist())
+    samples: list[dict] = []
     skipped = 0
     clamped = 0
     for qi in pick:
