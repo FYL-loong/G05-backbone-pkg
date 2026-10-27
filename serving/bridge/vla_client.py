@@ -759,18 +759,25 @@ def session_test(args) -> int:
     n = 0
     t_begin = time.monotonic()
     rc = EXIT_OK
+    dry = bool(getattr(args, "session_dry", False))
     try:
         with robot.motion_session():
-            print("  ✅ 会话已激活，开始 30Hz 命令当前位置")
             period = 1.0 / RATE
-            while time.monotonic() - t_begin < secs:
-                robot.check()                       # 心跳线程若故障会在这里抛
-                pos = np.asarray(
-                    robot.get_observations()["joint_positions"],
-                    dtype=np.float32).reshape(-1)
-                robot.command_joint_state(pos)      # 命令到"当前位置" ≈ 不动
-                n += 1
-                time.sleep(period)
+            if dry:
+                print(f"  ✅ 会话已激活（DRY 模式：{secs:.1f}s 内不下发任何指令）")
+                while time.monotonic() - t_begin < secs:
+                    robot.check()                   # 只维护心跳，不发命令
+                    time.sleep(period)
+            else:
+                print("  ✅ 会话已激活，开始 30Hz 命令当前位置")
+                while time.monotonic() - t_begin < secs:
+                    robot.check()                   # 心跳线程若故障会在这里抛
+                    pos = np.asarray(
+                        robot.get_observations()["joint_positions"],
+                        dtype=np.float32).reshape(-1)
+                    robot.command_joint_state(pos)  # 命令到"当前位置" ≈ 不动
+                    n += 1
+                    time.sleep(period)
     except Exception as exc:  # noqa: BLE001
         print(f"  ❌ 会话中断：{type(exc).__name__}: {exc}")
         rc = EXIT_UNHEALTHY
@@ -783,7 +790,7 @@ def session_test(args) -> int:
             st1 = {}
         robot.close(disable_motors=False)
 
-    print(f"\n  命令次数 = {n}   用时 = {dt:.1f}s   有效频率 = {n / dt if dt else 0:.1f} Hz")
+    print(f"\n  命令次数 = {n}   用时 = {dt:.1f}s   有效频率 = {(n / dt if dt else 0):.1f} Hz" + ("  (DRY：一条命令都没发)" if n == 0 else ""))
     print(f"  释放后：state={st1.get('state')!r} hold_confirmed={st1.get('hold_confirmed')} "
           f"reason={str(st1.get('reason'))[:80]!r}")
     if st1.get("state") != "safe_hold":
@@ -791,7 +798,7 @@ def session_test(args) -> int:
         return EXIT_UNHEALTHY
     if not st1.get("hold_confirmed"):
         print("  ⚠️ safe_hold 但 hold_confirmed 不是 True，再查一次")
-    if n < secs * RATE * 0.85:
+    if n > 0 and n < secs * RATE * 0.85:
         print(f"  ⚠️ 命令频率偏低（{n / dt:.1f}Hz，期望 ~{RATE}）")
         return EXIT_UNHEALTHY
     print("  ✅ 会话测试通过：能接管、能下发、释放后回到 safe_hold")
@@ -916,6 +923,9 @@ def main():
     ap.add_argument("--session-test", type=float, default=0.0, metavar="SECONDS",
                     help="安全会话测试：申请会话→30Hz 命令到当前位置（机械臂不移动）→"
                          "释放→复查 safe_hold。上真机前的关键一步")
+    ap.add_argument("--session-dry", action="store_true",
+                    help="配合 --session-test：只申请/持有/释放安全会话，"
+                         "**一条运动指令都不下发**（最保守的一步）")
     ap.add_argument("--camera-test", action="store_true",
                     help="相机只读测试：开 3 路、采 30 帧、打印形状/均值/耗时")
 
