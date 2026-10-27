@@ -125,8 +125,13 @@ def load_log(p: Path) -> dict:
         return json.load(f)
 
 
-def state_at(commands: list[dict], t_ref: float) -> tuple[np.ndarray, int]:
-    """取 state_time_s <= t_ref 的最后一条命令的 actual，并返回其下标。"""
+def state_at(commands: list[dict], t_ref: float) -> tuple[np.ndarray, int, bool]:
+    """取 state_time_s <= t_ref 的最后一条命令的 actual。
+
+    返回 ``(state, index, clamped)``。``clamped=True`` 表示 t_ref 早于所有命令
+    （会话最开头那一刻），此时退回第一条命令 —— 这是真实情况：policy 的第一帧
+    可能比第一条下发命令还早几毫秒。
+    """
     best_i = -1
     for i, c in enumerate(commands):
         st = c.get("state_time_s")
@@ -135,8 +140,8 @@ def state_at(commands: list[dict], t_ref: float) -> tuple[np.ndarray, int]:
         else:
             break
     if best_i < 0:
-        raise RuntimeError(f"t_ref={t_ref} 之前没有命令记录")
-    return np.asarray(commands[best_i]["actual"], dtype=np.float32), best_i
+        return np.asarray(commands[0]["actual"], dtype=np.float32), 0, True
+    return np.asarray(commands[best_i]["actual"], dtype=np.float32), best_i, False
 
 
 def delta_state(commands: list[dict], i: int) -> np.ndarray:
@@ -391,29 +396,39 @@ async def replay(args, vc) -> int:
     rng = np.random.default_rng(args.seed)
     n = min(args.samples, len(queries))
     pick = sorted(rng.choice(len(queries), size=n, replace=False).tolist())
-    samples = []
+    skipped = 0
+    clamped = 0
     for qi in pick:
         q = queries[qi]
+        # 取帧用 image_time_s；取状态用 query 自己记录的 state_time_s
+        # （两者相差几毫秒，混用会导致会话最开头的时刻找不到状态）
         t_ref = float(q["image_time_s"])
-        st, ci = state_at(commands, t_ref)
+        t_state = float(q.get("state_time_s") or q["image_time_s"])
+        st, ci, was_clamped = state_at(commands, t_state)
+        if was_clamped:
+            clamped += 1
         frames_wanted = {}
         ok = True
         for cam in ("main", "left", "right"):
             r = pick_frame(idx[cam], t_ref)
             if r is None:
-                print(f"  [skip] qi={qi} cam={cam} 没有 <= t={t_ref} 的帧")
+                # 会话最开头：left/right 的第一帧可能晚于 t_ref
                 ok = False
                 break
             frames_wanted[cam] = r
         if not ok:
+            skipped += 1
             continue
         samples.append({
-            "qi": qi, "q": q, "t_ref": t_ref, "state": st, "ci": ci,
+            "qi": qi, "q": q, "t_ref": t_ref, "t_state": t_state,
+            "state": st, "ci": ci, "clamped": was_clamped,
             "frames": frames_wanted,
             "dstate": delta_state(commands, ci),
             "ref": np.asarray(q["predicted_actions"][0], dtype=np.float32),
         })
-    print(f"  采样 {len(samples)} 个 chunk 时刻")
+    print(f"  采样 {len(samples)} 个 chunk 时刻"
+          + (f"（跳过 {skipped} 个：会话开头某路相机还没有因果帧）" if skipped else "")
+          + (f"（其中 {clamped} 个状态退回首条命令）" if clamped else ""))
 
     # 解码需要的帧（每路视频只顺序解码一次）
     print("  解码视频帧 ...")
@@ -443,6 +458,26 @@ async def replay(args, vc) -> int:
         print(f"  ❌ state 往返后 dtype={back['state']['left_arm'].dtype}")
         return 1
     print("  ✅ msgpack 往返无损（图像 uint8 (3,480,640)、state float32）")
+
+    # ── dry-run：只验证数据抽取，不起服务端、不跑模型 ──
+    if args.dry_run:
+        print("\n  [dry-run] 数据抽取检查（不起服务端）")
+        for i, s in enumerate(samples):
+            imgs = s["images"]
+            okimg = all(v is not None and v.shape == (480, 640, 3) and v.dtype == np.uint8
+                        for v in imgs.values())
+            means = {k: (None if v is None else round(float(v.mean()), 1))
+                     for k, v in imgs.items()}
+            print(f"  [{i:02d}] qi={s['qi']:2d} t_ref={s['t_ref']:.3f} "
+                  f"帧={ {c: s['frames'][c]['frame'] for c in s['frames']} } "
+                  f"clamped={s['clamped']} 图像OK={okimg} means={means}")
+            print(f"        state={np.round(s['state'], 4).tolist()}")
+            print(f"        ref  ={np.round(s['ref'], 4).tolist()}")
+            d = np.abs(s["ref"] - s["state"])
+            print(f"        |ref-state| max={float(d.max()):.4f} "
+                  f"argmax={DIM_NAMES[int(np.argmax(d))]}")
+        print(f"\n  [dry-run] {len(samples)} 个采样全部抽出成功；去掉 --dry-run 即可跑真推理")
+        return 0
 
     # 服务端
     proc = None
@@ -563,6 +598,8 @@ def main() -> int:
     ap.add_argument("--endpoint", default=None)
     ap.add_argument("--no-start-server", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--dry-run", action="store_true",
+                    help="只做数据抽取（解析日志/取帧/查状态），不起服务端、不跑模型；约 30s")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
 
