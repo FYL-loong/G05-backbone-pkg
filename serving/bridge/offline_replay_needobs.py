@@ -260,29 +260,37 @@ def compute_stats(ours: np.ndarray, ref: np.ndarray, state: np.ndarray,
 
 def print_report(ours, ref, state, dstate, stats, dim_names) -> int:
     n = stats["n"]
-    print("\n" + "=" * 104)
+    cr = stats["corr_ref"]
+    valid = np.isfinite(cr)
+    # 夹爪豁免"相关度≈0"硬判据：日志里 AR5k 的右夹爪是退化的（全程 0.0，后期跳到 1.0），
+    # 拿它当参照必然对不上，与本项目映射正确性无关。夹爪由 check_limits 单独把关。
+    GRIP_EXEMPT = {"L_grip", "R_grip"}
+    # "该关节这次会话里其实没动"的维度也豁免：std(state) < 0.01 rad 时两个模型都在它的
+    # 静止值附近各自自由浮动，互不相关是必然的，不能据此判映射错。
+    MOVING = stats["std_state"] >= 0.01
+
+    print("\n" + "=" * 108)
     print(f"  逐维统计（{n} 个采样；ref = 日志里 AR5k 的 predicted_actions[0]）")
-    print("=" * 104)
+    print("=" * 108)
     print(f"  {'dim':<10}{'std(state)':>12}{'std(ours)':>11}{'std(ref)':>10}"
-          f"{'corr(ours,ref)':>16}{'corr(Δstate)':>14}"
-          f"{'|ours-st| p50':>15}{'p95':>9}{'|ref-st| p50':>14}")
-    print("  " + "-" * 100)
+          f"{'corr(ours,ref)':>16}{'corr(dstate)':>14}"
+          f"{'|ours-st|p50':>14}{'p95':>9}{'|ref-st|p50':>13}  note")
+    print("  " + "-" * 104)
     for j, name in enumerate(dim_names):
-        cr = stats["corr_ref"][j]
         cd = stats["corr_dstate"][j]
         p50 = float(np.percentile(stats["abs_step"][:, j], 50))
         p95 = float(np.percentile(stats["abs_step"][:, j], 95))
         r50 = float(np.percentile(stats["abs_ref_step"][:, j], 50))
-        flag = " 靜" if np.isnan(cr) else ""
+        note = "静止(豁免)" if not MOVING[j] else ""
         print(f"  {name:<10}{stats['std_state'][j]:>12.5f}{stats['std_ours'][j]:>11.5f}"
               f"{stats['std_ref'][j]:>10.5f}"
-              f"{('static' if np.isnan(cr) else f'{cr:+.3f}'):>16}"
-              f"{('static' if np.isnan(cd) else f'{cd:+.3f}'):>14}"
-              f"{p50:>15.4f}{p95:>9.4f}{r50:>14.4f}{flag}")
-    n_static = int(np.sum(np.isnan(stats["corr_ref"])))
+              f"{(f'{cr[j]:+.3f}' if np.isfinite(cr[j]) else '   ---'):>16}"
+              f"{(f'{cd:+.3f}' if np.isfinite(cd) else '   ---'):>14}"
+              f"{p50:>14.4f}{p95:>9.4f}{r50:>13.4f}  {note}")
+    n_static = int(np.sum(~valid))
     if n_static:
-        print(f"  （{n_static} 维标记 static：标准差 < 0.01 rad，在这些维上算相关性没有意义，"
-              f"不参与判定）")
+        print(f"  （{n_static} 维相关性为 --- ：其中 std<0.01 rad 的视为静止；"
+              f"判定时只看「确实在动」的维度）")
 
     print("\n" + "=" * 96)
     print("  判定")
@@ -290,32 +298,36 @@ def print_report(ours, ref, state, dstate, stats, dim_names) -> int:
     fails: list[str] = []
     warns: list[str] = []
 
-    cr = stats["corr_ref"]
-    valid = ~np.isnan(cr)
-    # 夹爪豁免"相关度≈0"硬判据：日志里 AR5k 的右夹爪是退化的（全程 0.0，后期跳到 1.0），
-    # 拿它当参照必然对不上，与本项目映射正确性无关。夹爪由 check_limits 单独把关。
-    GRIP_EXEMPT = {"L_grip", "R_grip"}
+    def _exempt(j: int) -> bool:
+        return dim_names[j] in GRIP_EXEMPT or not MOVING[j]
+
     neg = [dim_names[j] for j in range(len(cr))
-           if valid[j] and cr[j] < -0.2 and dim_names[j] not in GRIP_EXEMPT]
+           if valid[j] and cr[j] < -0.2 and not _exempt(j)]
     # ★ 顺序/映射错的典型特征是"相关度≈0"，必须当硬失败（否则单向 swap 会被放过）
     dead = [dim_names[j] for j in range(len(cr))
-            if valid[j] and cr[j] < 0.1 and dim_names[j] not in GRIP_EXEMPT]
+            if valid[j] and cr[j] < 0.1 and not _exempt(j)]
     weak = [dim_names[j] for j in range(len(cr))
-            if valid[j] and 0.1 <= cr[j] < 0.35 and dim_names[j] not in GRIP_EXEMPT]
+            if valid[j] and 0.1 <= cr[j] < 0.35 and not _exempt(j)]
     grip_corr = {dim_names[j]: (None if not valid[j] else round(float(cr[j]), 3))
                  for j in range(len(cr)) if dim_names[j] in GRIP_EXEMPT}
+    exempt_notes = [f"{dim_names[j]}(corr={cr[j]:+.3f}, std(state)="
+                    f"{stats['std_state'][j]:.5f})"
+                    for j in range(len(cr))
+                    if valid[j] and not MOVING[j] and dim_names[j] not in GRIP_EXEMPT]
+    n_judged = int(sum(1 for j in range(len(cr))
+                       if valid[j] and MOVING[j] and dim_names[j] not in GRIP_EXEMPT))
 
     if neg:
         fails.append(f"❌ 符号翻转（负相关）：{neg}")
     if dead:
         fails.append(f"❌ 相关度≈0（疑似关节顺序/映射错）：{dead}")
     if not neg and not dead:
-        print("  ✅ 无符号翻转、无相关度≈0 的维度（臂关节）")
+        print(f"  ✅ 被判定的 {n_judged} 个「确实在动的」臂关节维全部正相关，无 ≈0、无负相关")
     if weak:
-        warns.append(f"🟡 相关偏弱：{weak}（若该维在数据里近似常数可忽略）")
-    if not weak:
-        print(f"  ✅ 全部 {int(valid.sum()) - sum(1 for k, v in grip_corr.items() if v is not None)}"
-              f" 个有效臂关节维与 ref 相关 > 0.35")
+        warns.append(f"🟡 相关偏弱（0.1~0.35，可能是两模型差异）：{weak}")
+    if exempt_notes:
+        warns.append("🟡 这些关节在会话里几乎静止，相关性无意义、已豁免："
+                     + ", ".join(exempt_notes))
     if grip_corr:
         print(f"  ℹ️ 夹爪与 AR5k 的相关性（仅供参考，AR5k 夹爪本身退化）：{grip_corr}")
 
@@ -548,10 +560,18 @@ async def replay(args, vc) -> int:
     if len(ours) < max(5, args.samples // 2):
         print(f"  ❌ 有效采样太少（{len(ours)}），无法统计")
         return 1
-    stats = compute_stats(np.stack(ours), np.stack(refs),
-                          np.stack(states), np.stack(dstates))
-    return print_report(np.stack(ours), np.stack(refs), np.stack(states),
-                        np.stack(dstates), stats, DIM_NAMES)
+    ours_a = np.stack(ours); refs_a = np.stack(refs)
+    states_a = np.stack(states); dstates_a = np.stack(dstates)
+    npz_path = (args.save_npz
+                or "/tmp/replay_samples_" + time.strftime("%Y%m%d_%H%M%S") + ".npz")
+    try:
+        np.savez(npz_path, ours=ours_a, refs=refs_a, states=states_a, dstates=dstates_a)
+        print(f"\n  采样数据已保存：{npz_path}")
+        print(f"  （改判据后可用 --from-npz {npz_path} 直接重算，不用再跑推理）")
+    except Exception as exc:
+        print(f"  [WARN] 保存 npz 失败：{exc}")
+    stats = compute_stats(ours_a, refs_a, states_a, dstates_a)
+    return print_report(ours_a, refs_a, states_a, dstates_a, stats, DIM_NAMES)
 
 
 def self_test() -> int:
@@ -624,11 +644,25 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--dry-run", action="store_true",
                     help="只做数据抽取（解析日志/取帧/查状态），不起服务端、不跑模型；约 30s")
+    ap.add_argument("--save-npz", default=None,
+                    help="把本次采样保存到 npz（默认 /tmp/replay_samples_<时间>.npz）")
+    ap.add_argument("--from-npz", default=None,
+                    help="跳过全部抽取/推理，直接从 npz 重算报告（改判据后用）")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
 
     if args.self_test:
         return self_test()
+
+    # 只重算报告
+    if args.from_npz:
+        d = np.load(args.from_npz)
+        print("=" * 96)
+        print(f"  从采样文件重算报告：{args.from_npz}")
+        print("=" * 96)
+        stats = compute_stats(d["ours"], d["refs"], d["states"], d["dstates"])
+        return print_report(d["ours"], d["refs"], d["states"], d["dstates"],
+                            stats, DIM_NAMES)
 
     vc = load_vla_client(Path(args.bridge))
 
