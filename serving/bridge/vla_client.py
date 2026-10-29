@@ -139,6 +139,10 @@ EXIT_CAMERA_STALE = 5
 EXIT_PREFLIGHT = 6
 EXIT_MODEL_INSANE = 7    # 模型输出异常（看门狗触发）
 
+# ★ patch 18：会话接管前等待上一次会话真正失效的时间上限（秒）
+# 守护进程用心跳超时判定 stale_clients，释放后约 1 秒才清空 session_id。
+SESSION_READY_TIMEOUT_S = 12.0
+
 
 # ─── msgpack + numpy codec (wire-compatible with g05.utils.websocket) ─────────
 
@@ -536,11 +540,48 @@ class ZmqYamRobot:
                 f"已有活跃控制会话，拒绝接管。status={st}")
         return st
 
+    def wait_session_ready(self, timeout: float = SESSION_READY_TIMEOUT_S) -> dict:
+        """★ patch 18：等守护进程"可以接管"再返回。
+
+        问题（2026-10-29 实测）：刚释放会话后立刻再次申请，会得到
+        ``RuntimeError: 已有活跃控制会话，拒绝接管``，因为守护进程判定
+        ``stale_clients`` 需要约 1 秒（心跳超时），释放瞬间它还是空的。
+        影响：连续跑两次 bridge 时第二次必失败。
+
+        判据：``state == 'safe_hold'`` 且 ``stale_clients`` 非空。
+        超时后不抛异常（交给 preflight 按原逻辑报错并给出清晰原因）。
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        waits = 0
+        last = {}
+        while True:
+            try:
+                last = self.status()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("读 status 失败：%s", exc)
+                last = {}
+            if last.get("state") == "safe_hold" and last.get("stale_clients"):
+                if waits:
+                    logger.info("会话可用（等了 %.1f s，stale_clients=%r）",
+                                waits * 0.1, last.get("stale_clients"))
+                return last
+            if time.monotonic() >= deadline:
+                if waits:
+                    logger.warning("等了 %.1f s 仍不能接管：state=%r stale_clients=%r —— "
+                                   "若刚跑过一次，请再等 1~2 秒", timeout,
+                                   last.get("state"), last.get("stale_clients"))
+                return last
+            if waits == 0:
+                logger.info("等待上一次会话释放（守护进程需约 1 秒判定心跳失效）...")
+            waits += 1
+            time.sleep(0.1)
+
     @contextmanager
     def motion_session(self):
         """申请独占受监督会话，退出时自动回到 safe_hold（并确认）。"""
         from gello.safety.motion_session import SupervisedMotionSession
 
+        self.wait_session_ready()      # ★ patch 18：先等上一次会话真正失效
         self.preflight()
         sid = uuid.uuid4().hex
         logger.info("申请安全会话 session=%s operation=g05_vla_bridge ...", sid)

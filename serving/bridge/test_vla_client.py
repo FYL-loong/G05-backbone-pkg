@@ -290,6 +290,55 @@ def test_camera_retry_shape_validation():
         assert images[k].shape == (3, 480, 640), images[k].shape
         assert images[k].dtype == np.uint8
 
+# ── 会话可用性等待（patch 18：刚释放后立刻接管会被拒）──────────────────────
+
+class _FakeSafety:
+    """第 ready_after 次 status() 才返回 stale_clients 非空。"""
+    def __init__(self, ready_after: int):
+        self.ready_after = ready_after
+        self.calls = 0
+
+    def status(self):
+        self.calls += 1
+        ready = self.calls >= self.ready_after
+        return {"state": "safe_hold",
+                "stale_clients": ["collector", "parent"] if ready else []}
+
+
+def _mk_robot_with_safety(fake):
+    r = vc.ZmqYamRobot.__new__(vc.ZmqYamRobot)
+    r.safety = fake
+    r._session = None
+    return r
+
+
+def test_wait_session_ready_polls_until_stale():
+    """前几次 stale_clients 为空时要继续等，直到非空。"""
+    fake = _FakeSafety(ready_after=4)
+    robot = _mk_robot_with_safety(fake)
+    st = robot.wait_session_ready(timeout=3.0)
+    assert st.get("stale_clients"), f"应等到非空，实际 {st}"
+    assert fake.calls >= 4, f"应至少轮询 4 次，实际 {fake.calls}"
+
+
+def test_wait_session_ready_returns_immediately_when_ready():
+    fake = _FakeSafety(ready_after=1)
+    robot = _mk_robot_with_safety(fake)
+    st = robot.wait_session_ready(timeout=3.0)
+    assert st.get("stale_clients")
+    assert fake.calls == 1, f"已就绪不该多次轮询，实际 {fake.calls}"
+
+
+def test_wait_session_ready_gives_up_without_raising():
+    """超时不应该抛异常（交给 preflight 报清晰原因）。"""
+    fake = _FakeSafety(ready_after=10 ** 9)
+    robot = _mk_robot_with_safety(fake)
+    t0 = time.time()
+    st = robot.wait_session_ready(timeout=0.35)
+    dt = time.time() - t0
+    assert not st.get("stale_clients")
+    assert dt < 2.0, f"超时后应立即返回，实际 {dt:.2f}s"
+
 # ── msgpack codec (optional) ─────────────────────────────────────────────────
 
 def test_codec_roundtrip():
