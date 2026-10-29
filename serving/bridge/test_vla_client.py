@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import sys
 
+import time
+
 import numpy as np
 
 import vla_client as vc
@@ -227,6 +229,66 @@ def test_rate_limit_shape_mismatch_raises():
     except ValueError:
         return
     _fail("shape 不符时应抛 ValueError")
+
+# ── RealCameras 重试语义（patch 14：合并同事的重试但推进 ts）─────────────────
+
+class _FakeYamCam:
+    """第 n 次调用才返回数据，用于验证重试是否用推进的 ts。"""
+    def __init__(self, succeed_at: int):
+        self.calls: list[float] = []
+        self.succeed_at = succeed_at
+
+    def sample(self, ts):
+        self.calls.append(ts)
+        if len(self.calls) < self.succeed_at:
+            return None
+        frames = {rig: np.zeros((480, 640, 3), np.uint8)
+                  for rig in ("main", "left", "right")}
+        return frames, ts
+
+
+def _mk_real_cameras(fake):
+    """绕过 __init__ 直接构造，避免依赖 yaml/yam_motion。"""
+    cams = vc.RealCameras.__new__(vc.RealCameras)
+    cams._cam = fake
+    cams._names = ["main", "left", "right"]
+    return cams
+
+
+def test_camera_retry_advances_timestamp():
+    """重试必须用**推进的 ts**，否则新帧会被因果过滤拒掉（同事的修法的隐患）。"""
+    fake = _FakeYamCam(succeed_at=3)
+    cams = _mk_real_cameras(fake)
+    out = cams.sample(1000.0, retry_s=0.5)
+    assert out is not None, "重试 3 次后应成功"
+    assert len(fake.calls) == 3, f"应调用 3 次，实际 {len(fake.calls)}"
+    # 后续调用的 ts 必须 > 首次 ts（否则新帧被拒）
+    assert fake.calls[1] > fake.calls[0], f"ts 没有推进：{fake.calls}"
+    assert fake.calls[2] > fake.calls[1], f"ts 没有推进：{fake.calls}"
+
+
+def test_camera_retry_gives_up_after_window():
+    """窗口内一直拿不到就要返回 None（交给外层宽容处理），不能无限重试。"""
+    fake = _FakeYamCam(succeed_at=10 ** 9)
+    cams = _mk_real_cameras(fake)
+    t0 = time.time()
+    out = cams.sample(1000.0, retry_s=0.05)
+    dt = time.time() - t0
+    assert out is None, "应返回 None"
+    assert dt < 0.5, f"重试窗口失控：{dt:.3f}s"
+    assert len(fake.calls) >= 2, "应至少重试过"
+
+
+def test_camera_retry_shape_validation():
+    """取到帧后仍要校验 CHW 形状。"""
+    fake = _FakeYamCam(succeed_at=1)
+    cams = _mk_real_cameras(fake)
+    out = cams.sample(1000.0)
+    assert out is not None
+    images, _ts = out
+    for k in ("head_rgb", "left_wrist_rgb", "right_wrist_rgb"):
+        assert images[k].shape == (3, 480, 640), images[k].shape
+        assert images[k].dtype == np.uint8
 
 # ── msgpack codec (optional) ─────────────────────────────────────────────────
 

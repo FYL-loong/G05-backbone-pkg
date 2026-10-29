@@ -114,6 +114,7 @@ GRIPPER_JOINTS = (6, 13)        # 左右夹爪在 14 维里的下标
 # 就会让整次运行提前结束。改成：先保持当前位置重试，持续超过阈值才真 abort。
 CAMERA_MAX_AGE_S = 0.20         # 允许 6 帧（30Hz）的陈旧度
 CAMERA_STALL_ABORT_S = 1.0      # 连续 1 s 拿不到可用帧才判定相机故障
+CAMERA_SAMPLE_RETRY_S = 0.045   # 单次取帧内部重试窗口（>1 个帧周期 33ms）
 
 # 退出码：0 = 正常跑完；>=2 = 被安全停机制中断（上层脚本据此判失败）
 EXIT_OK = 0
@@ -331,10 +332,38 @@ class RealCameras:
     def start(self) -> None:
         self._cam.start()
 
-    def sample(self, ts: float):
-        out = self._cam.sample(ts)
-        if out is None:
-            return None
+    def sample(self, ts: float, retry_s: float | None = None):
+        """取一组因果帧。
+
+        ★ patch 14：内层重试（合并张恩同的 5×5ms 重试，但修了两个问题）：
+          ① 他重试用的是**同一个 ts** —— 而 ``YamCameras.sample(ts)`` 只接受
+             ``host_timestamp <= ts`` 的帧，新到的帧时间戳更晚会被因果过滤拒掉，
+             所以"那一刻还没帧"的情况用旧 ts 重试**永远拿不到**。
+             这里每次重试用**实时推进的 ts**。
+          ② 5×5ms=20ms 比一个帧周期（33ms @30Hz）还短，重试窗口不够。
+             默认给 ``CAMERA_SAMPLE_RETRY_S``（45ms，>1 个帧周期）。
+        失败（连续取不到）仍返回 None，由外层再做"原地保持 1 s"的宽容处理。
+        """
+        if retry_s is None:
+            retry_s = CAMERA_SAMPLE_RETRY_S
+        deadline = time.monotonic() + max(0.0, retry_s)
+        out = None
+        last_ts = float(ts)
+        while True:
+            # ★ 关键：每次重试都**推进**时间戳，否则新到帧的时间戳更晚会被
+            #   ``host_timestamp <= ts`` 的因果过滤拒掉，重试永远无效。
+            #   这里还要防 monotonic() 在本机分辨率较粗时两次返回同值（Windows
+            #   实测出现过），所以低于上次就强制 +1ms 递增。
+            now = max(ts, time.monotonic())
+            if now <= last_ts:
+                now = last_ts + 0.001
+            last_ts = now
+            out = self._cam.sample(now)
+            if out is not None:
+                break
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.004)
         frames, min_ts = out
         chw = {}
         for rig_name in ("main", "left", "right"):
