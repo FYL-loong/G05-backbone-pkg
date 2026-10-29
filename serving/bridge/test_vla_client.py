@@ -149,6 +149,85 @@ def test_null_cameras_shape():
     c.close()
 
 
+# ── rate_limit_target（patch 10：夹爪/臂限速）─────────────────────────────────
+
+def test_rate_limit_gripper_snap_is_clipped():
+    """夹爪一步 0→1 必须被切成 0.7/s（1/30 步 → 每步 0.0233，全行程 43 步）。"""
+    prev = np.zeros(14, dtype=np.float32)
+    prev[6] = 0.0
+    tgt = prev.copy()
+    tgt[6] = 1.0                    # 模型想让左夹爪瞬间全闭
+    out, cg, ca = vc.rate_limit_target(tgt, prev, 1.0 / vc.RATE,
+                                      gripper_rate=0.7, arm_speed=2.5)
+    cap = 0.7 / vc.RATE
+    assert abs(float(out[6]) - cap) < 1e-6, f"out={out[6]} 期望 {cap}"
+    assert cg > 0.9, f"应报告裁剪量，实际 {cg}"
+    assert ca == 0.0, "臂不该被裁剪"
+
+    n = int(round(1.0 / cap))
+    assert n == 43, f"0→1 应需 43 步（1.43 s），实际 {n}"
+
+
+def test_rate_limit_gripper_reaches_target_in_1_4s():
+    """连续按 0.7/s 推，0→1 约 1.43 s 完成。"""
+    prev = np.zeros(14, dtype=np.float32)
+    tgt = prev.copy()
+    tgt[6] = 1.0
+    cur = prev.copy()
+    steps = 0
+    while steps < 200 and abs(float(cur[6]) - 1.0) > 1e-6:
+        cur, _, _ = vc.rate_limit_target(tgt, cur, 1.0 / vc.RATE,
+                                         gripper_rate=0.7, arm_speed=2.5)
+        steps += 1
+    assert abs(float(cur[6]) - 1.0) < 1e-5, f"没到 1.0，停在 {cur[6]}"
+    assert 42 <= steps <= 44, f"应 ~43 步，实际 {steps}"
+
+
+def test_rate_limit_arm_spike_clipped_but_normal_motion_passes():
+    prev = np.zeros(14, dtype=np.float32)
+    # 正常步进 0.07 rad（≈2.1 rad/s）应原样通过
+    tgt = prev.copy()
+    tgt[0] = 0.07
+    out, cg, ca = vc.rate_limit_target(tgt, prev, 1.0 / vc.RATE, arm_speed=2.5)
+    assert abs(float(out[0]) - 0.07) < 1e-6, "正常步进不该被裁"
+    assert ca == 0.0
+    # 换段尖峰 0.5 rad（一步 15 rad/s）必须被裁到 2.5/30=0.0833
+    tgt[0] = 0.5
+    out, cg, ca = vc.rate_limit_target(tgt, prev, 1.0 / vc.RATE, arm_speed=2.5)
+    cap = 2.5 / vc.RATE
+    assert abs(float(out[0]) - cap) < 1e-6, f"应裁到 {cap}，实际 {out[0]}"
+    assert ca > 0.4
+
+
+def test_rate_limit_disabled():
+    prev = np.zeros(14, dtype=np.float32)
+    tgt = prev.copy()
+    tgt[6] = 1.0
+    tgt[0] = 1.0
+    out, cg, ca = vc.rate_limit_target(tgt, prev, 1.0 / vc.RATE,
+                                      gripper_rate=0.0, arm_speed=0.0)
+    np.testing.assert_allclose(out, tgt, atol=1e-6)
+    assert cg == 0.0 and ca == 0.0
+
+
+def test_rate_limit_bad_dt_falls_back_to_nominal():
+    """异常 dt（0 或过大）应回落到标称周期，不放大限速。"""
+    prev = np.zeros(14, dtype=np.float32)
+    tgt = prev.copy()
+    tgt[6] = 1.0
+    cap = 0.7 / vc.RATE
+    for dt in (0.0, -1.0, 5.0):
+        out, _, _ = vc.rate_limit_target(tgt, prev, dt, gripper_rate=0.7)
+        assert abs(float(out[6]) - cap) < 1e-6, f"dt={dt} 时 out={out[6]}"
+
+
+def test_rate_limit_shape_mismatch_raises():
+    try:
+        vc.rate_limit_target(np.zeros(14, np.float32), np.zeros(13, np.float32), 0.033)
+    except ValueError:
+        return
+    _fail("shape 不符时应抛 ValueError")
+
 # ── msgpack codec (optional) ─────────────────────────────────────────────────
 
 def test_codec_roundtrip():

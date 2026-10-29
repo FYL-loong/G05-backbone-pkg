@@ -96,6 +96,25 @@ RECV_TIMEOUT_S = 10.0    # 稳态服务端 Recompute 实测 p50 ≈ 513 ms
 JUMP_WARN_DEG = 5.0      # 一步内臂关节变化超过这个角度就告警
 NUM_JOINTS = 14
 
+# ★ patch 10/11：执行层限速（2026-10-29 真机症状复盘后加）
+# 背景：真机上出现 (a) 第一次夹取把小方块"夹飞"，(b) 换段时乱动。
+# 根因：桥接层把模型输出的**绝对目标原样下发**，而模型的夹爪输出可能在一步内
+# 从 0 跳到 1 —— 30Hz 下就是 33 ms 走完全行程，夹爪"啪"一下弹合把物体弹飞。
+# yam_motion 的标准配置（live_configs/runtime.yaml）是：
+#     gripper_rate_limit: {opening_speed_s: 0.7, closing_speed_s: 0.7}
+#     g05_joint_handoff:  {max_speed_rad_s: 0.5}
+# 即夹爪 0→1 需要 1.43 s。我们照它来实现。
+GRIPPER_RATE_LIMIT_S = 0.7      # 单位/秒（归一化夹爪行程），0→1 需 1.43 s
+ARM_MAX_SPEED_RAD_S = 2.5       # 143°/s。实测正常步进 0.9~2.1 rad/s，
+                                # 这个值只裁剪换段尖峰，不干扰正常跟随
+GRIPPER_JOINTS = (6, 13)        # 左右夹爪在 14 维里的下标
+
+# ★ patch 11：相机丢帧容忍
+# 原来 max_age_s=0.1、且单帧取不到就直接 abort —— RealSense 偶发 100~300ms 卡顿
+# 就会让整次运行提前结束。改成：先保持当前位置重试，持续超过阈值才真 abort。
+CAMERA_MAX_AGE_S = 0.20         # 允许 6 帧（30Hz）的陈旧度
+CAMERA_STALL_ABORT_S = 1.0      # 连续 1 s 拿不到可用帧才判定相机故障
+
 # 退出码：0 = 正常跑完；>=2 = 被安全停机制中断（上层脚本据此判失败）
 EXIT_OK = 0
 EXIT_UNHEALTHY = 2
@@ -182,6 +201,12 @@ STATE_SPLIT = {
 ACTION_KEYS = ["left_arm", "left_gripper", "right_arm", "right_gripper"]
 ARM_JOINTS = np.r_[0:6, 7:13]   # 12 个臂关节下标（不含夹爪）
 
+# 仅用于日志里的可读维度名
+DIM_NAMES_FOR_LOG = [
+    "L_arm1", "L_arm2", "L_arm3", "L_arm4", "L_arm5", "L_arm6", "L_grip",
+    "R_arm1", "R_arm2", "R_arm3", "R_arm4", "R_arm5", "R_arm6", "R_grip",
+]
+
 
 # ─── pure joint mapping (unit-tested) ────────────────────────────────────────
 
@@ -212,6 +237,39 @@ def action_to_target(action: dict, last_target: np.ndarray) -> np.ndarray:
         parts.append(arr)
     return np.concatenate(parts)
 
+
+def rate_limit_target(target: np.ndarray, prev: np.ndarray, dt_s: float,
+                      gripper_rate: float = GRIPPER_RATE_LIMIT_S,
+                      arm_speed: float = ARM_MAX_SPEED_RAD_S):
+    """按速度上限裁剪目标（patch 10）。返回 ``(new_target, clipped_grip, clipped_arm)``。
+
+    为什么需要：模型输出的是**绝对目标**，夹爪维度可能一步之内 0→1。
+    30 Hz 下那就是 33 ms 走完全行程 —— 夹爪"啪"一下弹合会把物体弹飞。
+    ``yam_motion`` 的标准值（live_configs/runtime.yaml）是 0.7/s，即 0→1 需 1.43 s。
+
+    臂用 2.5 rad/s：实测正常步进 0.9~2.1 rad/s，这个值只裁剪换段尖峰。
+    ``0`` 表示该路限速关闭。
+    """
+    out = np.asarray(target, dtype=np.float64).copy()
+    prev = np.asarray(prev, dtype=np.float64)
+    if out.shape != prev.shape:
+        raise ValueError(f"shape mismatch {out.shape} vs {prev.shape}")
+    if dt_s <= 0 or dt_s > 0.5:      # 异常间隔不放大限速
+        dt_s = 1.0 / RATE
+    clip_grip = 0.0
+    clip_arm = 0.0
+    for j in range(out.shape[0]):
+        cap = (gripper_rate if j in GRIPPER_JOINTS else arm_speed) * dt_s
+        if cap <= 0:
+            continue
+        d = float(out[j] - prev[j])
+        if abs(d) > cap:
+            out[j] = prev[j] + np.sign(d) * cap
+            if j in GRIPPER_JOINTS:
+                clip_grip = max(clip_grip, abs(d) - cap)
+            else:
+                clip_arm = max(clip_arm, abs(d) - cap)
+    return out.astype(np.float32), clip_grip, clip_arm
 
 def build_obs(state: np.ndarray, images: dict[str, np.ndarray],
               task: str, frequency: float) -> dict:
@@ -250,7 +308,7 @@ class RealCameras:
     """
 
     def __init__(self, robot_cfg_path: str, motion_src: str,
-                 max_age_s: float = 0.1) -> None:
+                 max_age_s: float = CAMERA_MAX_AGE_S) -> None:
         import yaml  # 只有真机相机路径才需要
 
         if motion_src not in sys.path:
@@ -581,10 +639,12 @@ def _ws_connect(uri: str):
 
 
 async def _loop(ws, robot, cameras, task, steps, duration, limits,
-                jump_warn, max_step, latencies, t_run0, last):
+                jump_warn, max_step, latencies, t_run0, last,
+                gripper_rate=GRIPPER_RATE_LIMIT_S, arm_speed=ARM_MAX_SPEED_RAD_S,
+                cam_stall_abort=CAMERA_STALL_ABORT_S):
     """主循环。``last`` 是 ``{"t": ndarray}`` 的可变容器（上一帧命令的目标）。
 
-    返回 (exit_code, step, behind)。
+    返回 (exit_code, step, behind, stats)。
     """
     period = 1.0 / RATE
     hello = unpackb(await ws.recv())
@@ -598,12 +658,20 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
         logger.warning("server action_steps=%s > 16: 前瞻窗口只有 "
                        "action_steps/RATE = %.0f ms", action_steps,
                        float(action_steps) * 1000.0 / RATE)
+    logger.info("执行层限速：夹爪 %.2f/s（全行程 %.2f s）；臂 %.2f rad/s（%.0f°/s）%s",
+                gripper_rate, (1.0 / gripper_rate) if gripper_rate > 0 else 0,
+                arm_speed, np.rad2deg(arm_speed),
+                "" if gripper_rate > 0 else "  ⚠️ 夹爪限速已关闭（容易把物体夹飞）")
 
     need_obs = True
     next_tick = time.monotonic()
     step = 0
     behind = 0
     exit_code = EXIT_OK
+    last_cmd_t = time.monotonic()
+    cam_misses_total = 0
+    grip_clip_steps = 0
+    arm_clip_steps = 0
 
     while True:
         if steps > 0 and step >= steps:
@@ -640,12 +708,29 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
             break
 
         if need_obs:
+            # ★ patch 11：相机丢帧容忍 —— 先保持当前位置重试，别一帧就 abort
+            period = 1.0 / RATE
             cam = cameras.sample(now)
             if cam is None:
-                logger.error("相机帧缺失/过旧 → safe hold")
-                robot.enter_safe_hold(reason="camera stale")
-                exit_code = EXIT_CAMERA_STALE
-                break
+                stall_deadline = time.monotonic() + cam_stall_abort
+                n_miss = 1
+                while time.monotonic() < stall_deadline:
+                    robot.command_joint_state(last["t"])      # 原地保持，不动
+                    await asyncio.sleep(period)
+                    cam = cameras.sample(time.monotonic())
+                    if cam is not None:
+                        break
+                    n_miss += 1
+                if cam is None:
+                    logger.error("相机连续 %.1fs 无可用帧（丢 %d 次）→ safe hold",
+                                 cam_stall_abort, n_miss)
+                    robot.enter_safe_hold(reason="camera stalled")
+                    exit_code = EXIT_CAMERA_STALE
+                    break
+                cam_misses_total += n_miss
+                logger.warning("相机丢帧 %d 次后恢复（累计 %d），已原地保持等待",
+                               n_miss, cam_misses_total)
+                next_tick = time.monotonic()          # 等待期间时钟已滞后，重对齐
             images, _frame_ts = cam
             obs = build_obs(state, images, task, RATE)
         else:
@@ -687,19 +772,49 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
             exit_code = EXIT_SERVER_ERROR
             break
 
-        # 关节跳变诊断 + 可选斜率限幅
+        # ── 关节跳变诊断 ───────────────────────────────────────────────────
         delta = target[ARM_JOINTS] - last["t"][ARM_JOINTS]
         jump = float(np.max(np.abs(delta))) if delta.size else 0.0
         if jump > jump_warn:
-            logger.warning("step %d: 关节跳变 %.1f°（换段？）", step, np.rad2deg(jump))
-        if max_step > 0 and jump > max_step:
-            target[ARM_JOINTS] = last["t"][ARM_JOINTS] + delta * (max_step / jump)
+            j = int(np.argmax(np.abs(delta)))
+            dim_name = DIM_NAMES_FOR_LOG[int(ARM_JOINTS[j])]
+            logger.warning("step %d: 关节跳变 %.1f°（%s，换段？）",
+                           step, np.rad2deg(jump), dim_name)
+
+        # ── ★ patch 10：执行层限速（这一条是"夹飞"/"换段乱动"的核心修复）──
+        # 夹爪：0.7/s（0→1 需 1.43 s，对齐 yam_motion 的 gripper_rate_limit）
+        # 臂  ：2.5 rad/s（143°/s，只裁剪换段尖峰，不干扰正常跟随）
+        now_cmd = time.monotonic()
+        target, clipped_grip, clipped_arm = rate_limit_target(
+            target, last["t"], now_cmd - last_cmd_t,
+            gripper_rate=gripper_rate, arm_speed=arm_speed)
+        if clipped_grip > 1e-6:
+            grip_clip_steps += 1
+            if grip_clip_steps <= 5 or grip_clip_steps % 30 == 0:
+                logger.info("夹爪限速生效：本步裁剪 %.3f（%.2f/s → 全行程需 %.2f s）"
+                            "（第 %d 次）", clipped_grip, gripper_rate,
+                            (1.0 / gripper_rate) if gripper_rate > 0 else 0,
+                            grip_clip_steps)
+        if clipped_arm > 1e-6:
+            arm_clip_steps += 1
+            if arm_clip_steps <= 5 or arm_clip_steps % 30 == 0:
+                logger.warning("臂限速生效：本步裁剪 %.1f°（第 %d 次）—— "
+                               "这就是换段跳变，被限速平滑掉",
+                               np.rad2deg(clipped_arm), arm_clip_steps)
+
+        # 兼容旧的硬钳位参数（--max-joint-step-deg，默认关闭）
+        if max_step > 0:
+            delta2 = target[ARM_JOINTS] - last["t"][ARM_JOINTS]
+            jump2 = float(np.max(np.abs(delta2))) if delta2.size else 0.0
+            if jump2 > max_step:
+                target[ARM_JOINTS] = last["t"][ARM_JOINTS] + delta2 * (max_step / jump2)
 
         if limits is not None:
             target = np.clip(target, limits[:, 0], limits[:, 1])
         target = target.astype(np.float32)
         robot.command_joint_state(target)
         last["t"] = target
+        last_cmd_t = now_cmd
 
         need_obs = bool(resp.get("need_obs", True))
         step += 1
@@ -713,7 +828,11 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
             if behind % 30 == 1:
                 logger.warning("落后 %.0f ms（step %d）", -delay * 1e3, step)
 
-    return exit_code, step, behind
+    return exit_code, step, behind, {
+        "cam_misses": cam_misses_total,
+        "gripper_clipped_steps": grip_clip_steps,
+        "arm_clipped_steps": arm_clip_steps,
+    }
 
 
 def camera_test(args) -> int:
@@ -842,7 +961,8 @@ async def run(args) -> int:
             return EXIT_PREFLIGHT
 
     cameras = NullCameras() if args.fake_images else RealCameras(
-        args.camera_config, args.motion_src)
+        args.camera_config, args.motion_src,
+        max_age_s=float(getattr(args, "camera_max_age_s", CAMERA_MAX_AGE_S)))
     cameras.start()
     logger.info("cameras: %s", "synthetic zeros" if args.fake_images else args.camera_config)
 
@@ -865,6 +985,13 @@ async def run(args) -> int:
     jump_warn = np.deg2rad(JUMP_WARN_DEG)
     max_step = np.deg2rad(args.max_joint_step_deg) if args.max_joint_step_deg > 0 else 0.0
     latencies: list[float] = []
+    loop_kw = dict(
+        gripper_rate=float(args.gripper_rate_limit),
+        arm_speed=float(args.arm_max_speed_rad_s),
+        cam_stall_abort=float(args.camera_stall_abort_s),
+    )
+    logger.info("执行层配置：夹爪限速 %.2f/s，臂限速 %.2f rad/s，相机停顿阈值 %.1fs",
+                loop_kw["gripper_rate"], loop_kw["arm_speed"], loop_kw["cam_stall_abort"])
 
     last = {"t": np.asarray(
         robot.get_observations()["joint_positions"], dtype=np.float32).reshape(-1)}
@@ -884,18 +1011,21 @@ async def run(args) -> int:
     exit_code = EXIT_OK
     step = 0
     behind = 0
+    stats: dict = {}
     try:
         ws_ctx = _ws_connect(f"ws://{args.host}:{args.port}")
         async with ws_ctx as ws:
             if backend == "zmq":
                 with robot.motion_session():
-                    exit_code, step, behind = await _loop(
+                    exit_code, step, behind, stats = await _loop(
                         ws, robot, cameras, args.task, args.steps, args.duration,
-                        limits, jump_warn, max_step, latencies, t_run0, last)
+                        limits, jump_warn, max_step, latencies, t_run0, last,
+                        **loop_kw)
             else:
-                exit_code, step, behind = await _loop(
+                exit_code, step, behind, stats = await _loop(
                     ws, robot, cameras, args.task, args.steps, args.duration,
-                    limits, jump_warn, max_step, latencies, t_run0, last)
+                    limits, jump_warn, max_step, latencies, t_run0, last,
+                    **loop_kw)
     except Exception as exc:  # noqa: BLE001
         logger.error("运行异常：%s: %s", type(exc).__name__, exc)
         exit_code = EXIT_SERVER_ERROR
@@ -921,6 +1051,15 @@ async def run(args) -> int:
                         arr.size, arr.mean(), np.percentile(arr, 50),
                         np.percentile(arr, 99), arr.max())
         logger.info("steps completed=%d behind_schedule=%d", step, behind)
+        if stats:
+            logger.info("执行层统计：相机丢帧恢复 %d 次；夹爪被限速 %d 步；臂被限速 %d 步",
+                        stats.get("cam_misses", 0),
+                        stats.get("gripper_clipped_steps", 0),
+                        stats.get("arm_clipped_steps", 0))
+            if stats.get("arm_clipped_steps", 0):
+                logger.warning("臂限速生效了 %d 步 —— 说明换段确实有跳变，"
+                               "已被平滑；若仍觉动作生硬可调小 --arm-max-speed-rad-s",
+                               stats["arm_clipped_steps"])
 
     return exit_code
 
@@ -979,6 +1118,17 @@ def main():
     ap.add_argument("--motion-src", default=None,
                     help="yam_motion 的 src 目录（提供 YamCameras）")
 
+    # ★ patch 10/11：执行层限速
+    ap.add_argument("--gripper-rate-limit", type=float, default=GRIPPER_RATE_LIMIT_S,
+                    help="夹爪限速（单位/秒）。0.7 表示 0→1 需 1.43 s，"
+                         "对齐 yam_motion 的 gripper_rate_limit；0 = 关闭（易把物体夹飞）")
+    ap.add_argument("--arm-max-speed-rad-s", type=float, default=ARM_MAX_SPEED_RAD_S,
+                    help="臂关节速度上限（rad/s）。默认 2.5（≈143°/s），"
+                         "只裁剪换段尖峰、不干扰正常跟随；0 = 关闭")
+    ap.add_argument("--camera-stall-abort-s", type=float, default=CAMERA_STALL_ABORT_S,
+                    help="相机连续取不到帧超过这个秒数才 abort（期间原地保持）")
+    ap.add_argument("--camera-max-age-s", type=float, default=CAMERA_MAX_AGE_S,
+                    help="允许的相机帧陈旧度上限（秒），默认 0.20（≈6 帧 @30Hz）")
     ap.add_argument("--max-joint-step-deg", type=float, default=0.0,
                     help="可选的每步臂关节斜率限制（度）；0 = 关")
     ap.add_argument("--verbose", action="store_true")
