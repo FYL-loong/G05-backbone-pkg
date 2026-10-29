@@ -641,7 +641,7 @@ def _ws_connect(uri: str):
 async def _loop(ws, robot, cameras, task, steps, duration, limits,
                 jump_warn, max_step, latencies, t_run0, last,
                 gripper_rate=GRIPPER_RATE_LIMIT_S, arm_speed=ARM_MAX_SPEED_RAD_S,
-                cam_stall_abort=CAMERA_STALL_ABORT_S):
+                cam_stall_abort=CAMERA_STALL_ABORT_S, csv_writer=None):
     """主循环。``last`` 是 ``{"t": ndarray}`` 的可变容器（上一帧命令的目标）。
 
     返回 (exit_code, step, behind, stats)。
@@ -707,6 +707,7 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
             exit_code = EXIT_PREFLIGHT
             break
 
+        sent_obs = bool(need_obs)      # 本步是否发了真实观测（= 换段首帧）
         if need_obs:
             # ★ patch 11：相机丢帧容忍 —— 先保持当前位置重试，别一帧就 abort
             period = 1.0 / RATE
@@ -771,6 +772,7 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
             robot.enter_safe_hold(reason="bad action")
             exit_code = EXIT_SERVER_ERROR
             break
+        raw_target = target.copy()     # 限速前的模型原始输出（用于 CSV 诊断）
 
         # ── 关节跳变诊断 ───────────────────────────────────────────────────
         delta = target[ARM_JOINTS] - last["t"][ARM_JOINTS]
@@ -813,6 +815,25 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
             target = np.clip(target, limits[:, 0], limits[:, 1])
         target = target.astype(np.float32)
         robot.command_joint_state(target)
+        if csv_writer is not None:
+            try:
+                import json as _json
+                csv_writer.write(_json.dumps({
+                    "step": step,
+                    "t": round(now_cmd - t_run0, 4),
+                    "sent_obs": bool(sent_obs),          # 本步是否发了真实观测（=换段首帧）
+                    "prev": [round(float(x), 5) for x in last["t"]],
+                    "raw_target": [round(float(x), 5) for x in raw_target],
+                    "cmd_target": [round(float(x), 5) for x in target],
+                    "d_raw": [round(float(x), 5) for x in (raw_target - last["t"])],
+                    "d_cmd": [round(float(x), 5) for x in (target - last["t"])],
+                    "clip_grip": round(float(clipped_grip), 5),
+                    "clip_arm": round(float(clipped_arm), 5),
+                    "need_obs_next": bool(resp.get("need_obs", True)),
+                    "lat_ms": round((t_got - t_req) * 1e3, 1),
+                }) + "\n")
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("写 csv 失败：%s", exc)
         last["t"] = target
         last_cmd_t = now_cmd
 
@@ -985,10 +1006,17 @@ async def run(args) -> int:
     jump_warn = np.deg2rad(JUMP_WARN_DEG)
     max_step = np.deg2rad(args.max_joint_step_deg) if args.max_joint_step_deg > 0 else 0.0
     latencies: list[float] = []
+    csv_fh = None
+    csv_path = getattr(args, "log_csv", None)
+    if csv_path:
+        csv_fh = open(csv_path, "w", encoding="utf-8")
+        logger.info("CSV 诊断日志：%s（每步一行，含 raw_target/cmd_target/跳变/换段标记）",
+                    csv_path)
     loop_kw = dict(
         gripper_rate=float(args.gripper_rate_limit),
         arm_speed=float(args.arm_max_speed_rad_s),
         cam_stall_abort=float(args.camera_stall_abort_s),
+        csv_writer=csv_fh,
     )
     logger.info("执行层配置：夹爪限速 %.2f/s，臂限速 %.2f rad/s，相机停顿阈值 %.1fs",
                 loop_kw["gripper_rate"], loop_kw["arm_speed"], loop_kw["cam_stall_abort"])
@@ -1032,6 +1060,12 @@ async def run(args) -> int:
         raise
     finally:
         logger.info("收尾：safe hold + close")
+        if csv_fh is not None:
+            try:
+                csv_fh.close()
+                logger.info("CSV 诊断日志已写：%s", csv_path)
+            except Exception:  # noqa: BLE001
+                pass
         try:
             robot.enter_safe_hold(reason="bridge shutdown")
         except Exception as exc:  # noqa: BLE001
@@ -1119,6 +1153,8 @@ def main():
                     help="yam_motion 的 src 目录（提供 YamCameras）")
 
     # ★ patch 10/11：执行层限速
+    ap.add_argument("--log-csv", default=None, metavar="PATH",
+                    help="把每步的目标/跳变/换段标记写成 CSV（诊断换段跳变用）")
     ap.add_argument("--gripper-rate-limit", type=float, default=GRIPPER_RATE_LIMIT_S,
                     help="夹爪限速（单位/秒）。0.7 表示 0→1 需 1.43 s，"
                          "对齐 yam_motion 的 gripper_rate_limit；0 = 关闭（易把物体夹飞）")
