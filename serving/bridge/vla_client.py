@@ -116,6 +116,20 @@ CAMERA_MAX_AGE_S = 0.20         # 允许 6 帧（30Hz）的陈旧度
 CAMERA_STALL_ABORT_S = 1.0      # 连续 1 s 拿不到可用帧才判定相机故障
 CAMERA_SAMPLE_RETRY_S = 0.045   # 单次取帧内部重试窗口（>1 个帧周期 33ms）
 
+# ★ patch 16：模型输出合理性看门狗（2026-10-29 事故后加）
+# 事故：任务完成后模型输出崩坏，6 个右臂关节同一瞬间要求跳 40~62°，
+#       30Hz 来回摆动造成剧烈震动，右侧电机控制线程保护性停机（daemon 进 fault）。
+# 两道闸：
+#   ① 偏差闸 —— 单关节目标离当前姿态 > OUTPUT_SANITY_DEG 视为异常，
+#      连续 OUTPUT_SANITY_TRIP 步异常 → 立即安全停止。
+#      （正常跟踪时该偏差实测 p95 < 3°，留 20 倍余量）
+#   ② 振荡闸 —— 相邻两步的位移方向连续反向 OUTPUT_OSC_TRIP 次且幅度够大
+#      → 判定"来回抖动" → 立即安全停止。
+OUTPUT_SANITY_DEG = 60.0        # 单关节目标偏离当前姿态的上限（度）
+OUTPUT_SANITY_TRIP = 3          # 连续多少步超限才算真异常
+OUTPUT_OSC_DEG = 2.0            # 参与振荡判定的最小单步位移（度）
+OUTPUT_OSC_TRIP = 8             # 连续多少次方向反转折算振荡
+
 # 退出码：0 = 正常跑完；>=2 = 被安全停机制中断（上层脚本据此判失败）
 EXIT_OK = 0
 EXIT_UNHEALTHY = 2
@@ -123,6 +137,7 @@ EXIT_SERVER_ERROR = 3
 EXIT_TIMEOUT = 4
 EXIT_CAMERA_STALE = 5
 EXIT_PREFLIGHT = 6
+EXIT_MODEL_INSANE = 7    # 模型输出异常（看门狗触发）
 
 
 # ─── msgpack + numpy codec (wire-compatible with g05.utils.websocket) ─────────
@@ -529,14 +544,41 @@ class ZmqYamRobot:
         self.preflight()
         sid = uuid.uuid4().hex
         logger.info("申请安全会话 session=%s operation=g05_vla_bridge ...", sid)
-        with SupervisedMotionSession(self.safety, sid,
-                                     operation="g05_vla_bridge") as sess:
-            self._session = sess
-            logger.info("✅ 安全会话已激活（含 parent/collector 两个 200ms 心跳线程）")
+        try:
+            with SupervisedMotionSession(self.safety, sid,
+                                         operation="g05_vla_bridge") as sess:
+                self._session = sess
+                logger.info("✅ 安全会话已激活（含 parent/collector 两个 200ms 心跳线程）")
+                try:
+                    yield sess
+                finally:
+                    self._session = None
+        except Exception as exc:  # noqa: BLE001
+            # ★ patch 17：守护进程可能已经进 fault（例如电机链保护性停机），
+            #   hold() 拿不到确认时会抛 HoldNotConfirmed。这时不要再往上抛成
+            #   traceback 掩盖真正原因 —— 明确告诉操作员该查什么。
+            name = type(exc).__name__
+            logger.error("=" * 72)
+            logger.error("安全会话退出异常：%s: %s", name, exc)
             try:
-                yield sess
-            finally:
-                self._session = None
+                st = self.status()
+                hh = st.get("hardware_health") or {}
+                logger.error("守护进程 state=%r reason=%r", st.get("state"), st.get("reason"))
+                for side in ("left", "right"):
+                    s = (hh.get("sides") or {}).get(side) or {}
+                    logger.error("  %-5s ok=%s running=%s reason=%r", side,
+                                 s.get("ok"), s.get("running"), s.get("reason"))
+                if st.get("state") == "fault":
+                    logger.error(">>> 机器人已进入 FAULT，需要【重启安全守护进程】才能恢复：")
+                    logger.error(">>>   1) ps -p %s -o args=   # 查看当前启动命令",
+                                 st.get("pid"))
+                    logger.error(">>>   2) 停掉该进程后按原命令重启")
+                    logger.error(">>>   3) 重启后跑: vla_client.py --task x --check-robot")
+                    logger.error(">>>      必须看到 state='safe_hold' 且 hardware_health.ok=True")
+            except Exception as exc2:  # noqa: BLE001
+                logger.error("（读 status 也失败了：%s）", exc2)
+            logger.error("=" * 72)
+            raise
         logger.info("安全会话已释放 → 守护进程确认 SAFE HOLD")
 
     def check(self) -> None:
@@ -671,7 +713,11 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
                 jump_warn, max_step, latencies, t_run0, last,
                 gripper_rate=GRIPPER_RATE_LIMIT_S, arm_speed=ARM_MAX_SPEED_RAD_S,
                 cam_stall_abort=CAMERA_STALL_ABORT_S, csv_writer=None,
-                freeze_logger=None):
+                freeze_logger=None,
+                output_sanity_deg=OUTPUT_SANITY_DEG,
+                output_sanity_trip=OUTPUT_SANITY_TRIP,
+                output_osc_deg=OUTPUT_OSC_DEG,
+                output_osc_trip=OUTPUT_OSC_TRIP):
     """主循环。``last`` 是 ``{"t": ndarray}`` 的可变容器（上一帧命令的目标）。
 
     返回 (exit_code, step, behind, stats)。
@@ -703,6 +749,9 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
     grip_clip_steps = 0
     arm_clip_steps = 0
     images_for_log = None     # 最近一次真实观测的画面（patch 15）
+    sanity_bad = 0            # 连续超偏差步数（patch 16）
+    prev_delta = None         # 上一步位移向量（patch 16 振荡检测）
+    osc_count = 0             # 连续方向反转次数（patch 16）
     freeze_steps = 0          # 连续"几乎不动"的步数（patch 15 诊断）
     freeze_reports = 0
 
@@ -845,7 +894,41 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
             if jump2 > max_step:
                 target[ARM_JOINTS] = last["t"][ARM_JOINTS] + delta2 * (max_step / jump2)
 
-                # ── ★ patch 15：冻结检测（诊断"抓住后停在半空不动"）──────────────
+                # ── ★ patch 16：模型输出合理性看门狗（先于限速与下发）──────────────
+        _dev = np.rad2deg(np.abs(raw_target[ARM_JOINTS] - last["t"][ARM_JOINTS]))
+        _dev_max = float(_dev.max()) if _dev.size else 0.0
+        if _dev_max > output_sanity_deg:
+            sanity_bad += 1
+            logger.warning("⚠️ 模型输出异常：%s 目标偏离当前 %.1f°（上限 %.0f°），"
+                           "连续 %d/%d 步", DIM_NAMES_FOR_LOG[int(ARM_JOINTS[int(_dev.argmax())])],
+                           _dev_max, output_sanity_deg, sanity_bad, output_sanity_trip)
+        else:
+            sanity_bad = 0
+        if sanity_bad >= output_sanity_trip:
+            logger.error("🛑 模型输出持续异常 %d 步（最大偏离 %.1f°）→ 判定策略崩坏，"
+                         "立即安全停止（防剧烈震动损坏硬件）", sanity_bad, _dev_max)
+            robot.enter_safe_hold(reason="model output insane")
+            exit_code = EXIT_MODEL_INSANE
+            break
+
+        # 振荡闸：连续方向反转
+        _d = raw_target[ARM_JOINTS] - last["t"][ARM_JOINTS]
+        if np.rad2deg(np.abs(_d).max()) > output_osc_deg:
+            if prev_delta is not None and float(np.dot(prev_delta, _d)) < 0:
+                osc_count += 1
+            else:
+                osc_count = 0
+            prev_delta = _d.copy()
+        else:
+            osc_count = 0
+            prev_delta = None
+        if osc_count >= output_osc_trip:
+            logger.error("🛑 检测到持续振荡：模型输出连续 %d 次方向反转（每步 >%.0f°）"
+                         "→ 立即安全停止", osc_count, output_osc_deg)
+            robot.enter_safe_hold(reason="model oscillating")
+            exit_code = EXIT_MODEL_INSANE
+            break
+        # ── ★ patch 15：冻结检测（诊断"抓住后停在半空不动"）──────────────
         # 判定：本步模型原始输出相对上一步命令的位移 < 0.5° 且持续 ≥ 1 秒。
         # 命中时调用 freeze_logger（会存下"模型看到的三路画面"），每段只报一次。
         _raw_jump = float(np.max(np.abs(raw_target - last["t"])))
@@ -1130,6 +1213,8 @@ async def run(args) -> int:
         cam_stall_abort=float(args.camera_stall_abort_s),
         csv_writer=csv_fh,
         freeze_logger=freeze_logger,
+        output_sanity_deg=float(args.output_sanity_deg),
+        output_osc_trip=int(args.output_osc_trip),
     )
     logger.info("执行层配置：夹爪限速 %.2f/s，臂限速 %.2f rad/s，相机停顿阈值 %.1fs",
                 loop_kw["gripper_rate"], loop_kw["arm_speed"], loop_kw["cam_stall_abort"])
@@ -1251,6 +1336,11 @@ def main():
     ap.add_argument("--session-dry", action="store_true",
                     help="配合 --session-test：只申请/持有/释放安全会话，"
                          "**一条运动指令都不下发**（最保守的一步）")
+    ap.add_argument("--output-sanity-deg", type=float, default=OUTPUT_SANITY_DEG,
+                    help="看门狗：单关节目标偏离当前姿态超过这个角度视为模型输出异常"
+                         "（默认 60°，正常跟踪实测 p95<3°）；0 = 关闭")
+    ap.add_argument("--output-osc-trip", type=int, default=OUTPUT_OSC_TRIP,
+                    help="看门狗：连续多少次方向反转折算振荡（默认 8）；0 = 关闭")
     ap.add_argument("--snapshot-on-freeze", default=None, metavar="DIR",
                     help="运行中检测到模型连续 1 秒几乎不动时，把当时的三路画面存成 PNG"
                          "（诊断「夹住后停住」用）")
