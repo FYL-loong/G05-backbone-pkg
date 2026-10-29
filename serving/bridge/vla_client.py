@@ -139,6 +139,15 @@ OUTPUT_OSC_TRIP = 8             # 连续多少次方向反转折算振荡
 #   注意：滤波在限速**之前**，所以物理速度/限位仍然严格成立。
 CMD_LOWPASS_TAU_S = 0.0        # 0 = 关闭（默认不改变现有行为）
 
+# ★ patch 21：稳定即停（不靠猜时长）
+# 问题：训练 episode 约 16 秒，但 --duration 是硬切 —— 设短了切在任务中途，
+#   设长了会跑进"任务完成后模型崩坏区"（实测崩坏在 t≈12.4s 之后，且会震动）。
+# 做法：给一个宽松上限（如 40s），一旦模型原始输出连续 N 步几乎不变
+#   （|Δraw| < 0.3°）就判定"已收敛/已到位"，正常退出（退出码 0）。
+#   为防一开始就静止误判，必须先在 step>=60 且累计有过 >3° 的动作才启用。
+STOP_WHEN_STILL_STEPS = 0       # 0 = 关闭；建议 60（=2 秒）
+STILL_EPS_DEG = 0.3             # 判定"不动"的单步阈值（度）
+
 # 退出码：0 = 正常跑完；>=2 = 被安全停机制中断（上层脚本据此判失败）
 EXIT_OK = 0
 EXIT_UNHEALTHY = 2
@@ -787,7 +796,9 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
                 output_sanity_trip=OUTPUT_SANITY_TRIP,
                 output_osc_deg=OUTPUT_OSC_DEG,
                 output_osc_trip=OUTPUT_OSC_TRIP,
-                cmd_tau=CMD_LOWPASS_TAU_S):
+                cmd_tau=CMD_LOWPASS_TAU_S,
+                stop_still_steps=STOP_WHEN_STILL_STEPS,
+                still_eps_deg=STILL_EPS_DEG):
     """主循环。``last`` 是 ``{"t": ndarray}`` 的可变容器（上一帧命令的目标）。
 
     返回 (exit_code, step, behind, stats)。
@@ -822,6 +833,9 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
     sanity_bad = 0            # 连续超偏差步数（patch 16）
     prev_delta = None         # 上一步位移向量（patch 16 振荡检测）
     osc_count = 0             # 连续方向反转次数（patch 16）
+    prev_raw = None           # 上一步的模型原始输出（patch 21）
+    still_count = 0           # 连续"模型输出不动"步数（patch 21）
+    moved_deg = 0.0           # 累计最大单步位移（用于启用稳定检测）
     sm = None                 # 低通滤波状态（patch 20）
     smoothed_steps = 0
     freeze_steps = 0          # 连续"几乎不动"的步数（patch 15 诊断）
@@ -941,6 +955,29 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
         # ── ★ patch 10：执行层限速（这一条是"夹飞"/"换段乱动"的核心修复）──
         # 夹爪：0.7/s（0→1 需 1.43 s，对齐 yam_motion 的 gripper_rate_limit）
         # 臂  ：2.5 rad/s（143°/s，只裁剪换段尖峰，不干扰正常跟随）
+        # ── ★ patch 21：稳定即停（不靠猜时长）────────────────────────────
+        # 判据用【模型原始输出】的步间变化，不受限速和滤波影响。
+        # 启用条件：step >= 60（跑过 2 秒）且已出现过 >3° 的动作 ——
+        # 防止一开始就静止（例如模型还在等待）被误判成"已完成"。
+        if stop_still_steps > 0:
+            _rj = float(np.rad2deg(np.max(np.abs(
+                raw_target[ARM_JOINTS] - last["t"][ARM_JOINTS]))))
+            if prev_raw is not None:
+                _ds = float(np.rad2deg(np.max(np.abs(raw_target - prev_raw))))
+            else:
+                _ds = 999.0
+            prev_raw = raw_target.copy()
+            moved_deg = max(moved_deg, _rj)
+            if step >= 60 and moved_deg > 3.0 and _ds < still_eps_deg:
+                still_count += 1
+            else:
+                still_count = 0
+            if still_count >= stop_still_steps:
+                logger.info("模型输出连续 %d 步几乎不变（<%.1f°）且已运行 %.1fs "
+                            "→ 判定已到位，正常结束（累计最大位移 %.1f°）",
+                            still_count, still_eps_deg,
+                            time.monotonic() - t_run0, moved_deg)
+                break
         # ── ★ patch 20：命令低通滤波（"low gain"）────────────────────────
         # 放在限速之前：先滤掉模型输出在换段频率上的来回抖，再由限速保证
         # 物理速度上限。tau=0 时完全旁路（行为与之前一致）。
@@ -1072,6 +1109,7 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
         "arm_clipped_steps": arm_clip_steps,
         "freeze_reports": freeze_reports,
         "smoothed_steps": smoothed_steps,
+        "stopped_by_still": still_count >= stop_still_steps if stop_still_steps > 0 else False,
     }
 
 
@@ -1317,6 +1355,7 @@ async def run(args) -> int:
         output_sanity_deg=float(args.output_sanity_deg),
         output_osc_trip=int(args.output_osc_trip),
         cmd_tau=float(args.cmd_lowpass_tau),
+        stop_still_steps=int(args.stop_when_still),
     )
     logger.info("执行层配置：夹爪限速 %.2f/s，臂限速 %.2f rad/s，相机停顿阈值 %.1fs",
                 loop_kw["gripper_rate"], loop_kw["arm_speed"], loop_kw["cam_stall_abort"])
@@ -1441,6 +1480,9 @@ def main():
     ap.add_argument("--output-sanity-deg", type=float, default=OUTPUT_SANITY_DEG,
                     help="看门狗：单关节目标偏离当前姿态超过这个角度视为模型输出异常"
                          "（默认 60°，正常跟踪实测 p95<3°）；0 = 关闭")
+    ap.add_argument("--stop-when-still", type=int, default=STOP_WHEN_STILL_STEPS,
+                    help="模型输出连续 N 步几乎不变（<0.3°）就正常结束，不用猜 --duration。"
+                         "建议 60（2 秒）。0=关闭。配合较宽松的 --duration（如 40）使用")
     ap.add_argument("--cmd-lowpass-tau", type=float, default=CMD_LOWPASS_TAU_S,
                     help="命令一阶低通时间常数（秒）。0=关闭；建议 0.08~0.15 治"
                          "「回原位时震动」——把模型输出的来回抖滤成平滑运动，"
