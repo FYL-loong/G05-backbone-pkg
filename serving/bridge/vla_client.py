@@ -130,6 +130,15 @@ OUTPUT_SANITY_TRIP = 3          # 连续多少步超限才算真异常
 OUTPUT_OSC_DEG = 2.0            # 参与振荡判定的最小单步位移（度）
 OUTPUT_OSC_TRIP = 8             # 连续多少次方向反转折算振荡
 
+# ★ patch 20：命令低通滤波（"low gain"，治"回原位时震动"）
+# 背景（2026-10-29）：任务完成后模型要回原位，但回程轨迹在换段频率
+#   (~16 步 ≈ 0.53 s ≈ 1.9 Hz) 上反复反向 → 手臂震动而不是平滑移动。
+#   限速器是逐关节投影，不会引入方向反转 → 抖动来自模型输出本身。
+# 做法：一阶低通（EMA）  smoothed += alpha*(raw-smoothed),  alpha = dt/(tau+dt)
+#   tau=0 关闭（保持原样）；建议 0.08~0.15 s。
+#   注意：滤波在限速**之前**，所以物理速度/限位仍然严格成立。
+CMD_LOWPASS_TAU_S = 0.0        # 0 = 关闭（默认不改变现有行为）
+
 # 退出码：0 = 正常跑完；>=2 = 被安全停机制中断（上层脚本据此判失败）
 EXIT_OK = 0
 EXIT_UNHEALTHY = 2
@@ -257,6 +266,25 @@ def action_to_target(action: dict, last_target: np.ndarray) -> np.ndarray:
         parts.append(arr)
     return np.concatenate(parts)
 
+
+def lowpass_target(raw: np.ndarray, smoothed, dt_s: float,
+                   tau: float) -> tuple[np.ndarray, float]:
+    """一阶低通（patch 20，"low gain"）。返回 ``(new_smoothed, alpha)``。
+
+    用途：把模型输出在换段频率（~1.9 Hz）上的来回抖动滤成平滑运动。
+    ``tau <= 0`` 时直接旁路（alpha=1，行为与不滤波完全一致）。
+    ``smoothed is None`` 时用 raw 初始化（避免第 0 步从 0 猛冲）。
+    """
+    raw = np.asarray(raw, dtype=np.float64)
+    if tau <= 0:
+        return raw.astype(np.float32), 1.0
+    if smoothed is None:
+        return raw.astype(np.float32), 1.0
+    if dt_s <= 0 or dt_s > 0.5:      # 异常间隔用标称周期
+        dt_s = 1.0 / RATE
+    a = float(np.clip(dt_s / (tau + dt_s), 0.0, 1.0))
+    prev = np.asarray(smoothed, dtype=np.float64)
+    return (prev + a * (raw - prev)).astype(np.float32), a
 
 def rate_limit_target(target: np.ndarray, prev: np.ndarray, dt_s: float,
                       gripper_rate: float = GRIPPER_RATE_LIMIT_S,
@@ -758,7 +786,8 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
                 output_sanity_deg=OUTPUT_SANITY_DEG,
                 output_sanity_trip=OUTPUT_SANITY_TRIP,
                 output_osc_deg=OUTPUT_OSC_DEG,
-                output_osc_trip=OUTPUT_OSC_TRIP):
+                output_osc_trip=OUTPUT_OSC_TRIP,
+                cmd_tau=CMD_LOWPASS_TAU_S):
     """主循环。``last`` 是 ``{"t": ndarray}`` 的可变容器（上一帧命令的目标）。
 
     返回 (exit_code, step, behind, stats)。
@@ -793,6 +822,8 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
     sanity_bad = 0            # 连续超偏差步数（patch 16）
     prev_delta = None         # 上一步位移向量（patch 16 振荡检测）
     osc_count = 0             # 连续方向反转次数（patch 16）
+    sm = None                 # 低通滤波状态（patch 20）
+    smoothed_steps = 0
     freeze_steps = 0          # 连续"几乎不动"的步数（patch 15 诊断）
     freeze_reports = 0
 
@@ -910,6 +941,16 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
         # ── ★ patch 10：执行层限速（这一条是"夹飞"/"换段乱动"的核心修复）──
         # 夹爪：0.7/s（0→1 需 1.43 s，对齐 yam_motion 的 gripper_rate_limit）
         # 臂  ：2.5 rad/s（143°/s，只裁剪换段尖峰，不干扰正常跟随）
+        # ── ★ patch 20：命令低通滤波（"low gain"）────────────────────────
+        # 放在限速之前：先滤掉模型输出在换段频率上的来回抖，再由限速保证
+        # 物理速度上限。tau=0 时完全旁路（行为与之前一致）。
+        if cmd_tau > 0:
+            _was_none = sm is None
+            target, _a = lowpass_target(target, sm,
+                                        time.monotonic() - last_cmd_t, cmd_tau)
+            sm = target
+            if not _was_none:
+                smoothed_steps += 1
         now_cmd = time.monotonic()
         target, clipped_grip, clipped_arm = rate_limit_target(
             target, last["t"], now_cmd - last_cmd_t,
@@ -1030,6 +1071,7 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
         "gripper_clipped_steps": grip_clip_steps,
         "arm_clipped_steps": arm_clip_steps,
         "freeze_reports": freeze_reports,
+        "smoothed_steps": smoothed_steps,
     }
 
 
@@ -1274,6 +1316,7 @@ async def run(args) -> int:
         freeze_logger=freeze_logger,
         output_sanity_deg=float(args.output_sanity_deg),
         output_osc_trip=int(args.output_osc_trip),
+        cmd_tau=float(args.cmd_lowpass_tau),
     )
     logger.info("执行层配置：夹爪限速 %.2f/s，臂限速 %.2f rad/s，相机停顿阈值 %.1fs",
                 loop_kw["gripper_rate"], loop_kw["arm_speed"], loop_kw["cam_stall_abort"])
@@ -1398,6 +1441,10 @@ def main():
     ap.add_argument("--output-sanity-deg", type=float, default=OUTPUT_SANITY_DEG,
                     help="看门狗：单关节目标偏离当前姿态超过这个角度视为模型输出异常"
                          "（默认 60°，正常跟踪实测 p95<3°）；0 = 关闭")
+    ap.add_argument("--cmd-lowpass-tau", type=float, default=CMD_LOWPASS_TAU_S,
+                    help="命令一阶低通时间常数（秒）。0=关闭；建议 0.08~0.15 治"
+                         "「回原位时震动」——把模型输出的来回抖滤成平滑运动，"
+                         "且滤波在限速之前，物理限位依然严格")
     ap.add_argument("--output-osc-trip", type=int, default=OUTPUT_OSC_TRIP,
                     help="看门狗：连续多少次方向反转折算振荡（默认 8）；0 = 关闭")
     ap.add_argument("--snapshot-on-freeze", default=None, metavar="DIR",

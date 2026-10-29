@@ -290,6 +290,62 @@ def test_camera_retry_shape_validation():
         assert images[k].shape == (3, 480, 640), images[k].shape
         assert images[k].dtype == np.uint8
 
+# ── 命令低通滤波（patch 20：治"回原位时震动"）─────────────────────────────
+
+def test_lowpass_disabled_is_passthrough():
+    raw = np.array([0.5, -0.3] + [0.0] * 12, np.float32)
+    out, alpha = vc.lowpass_target(raw, np.zeros(14, np.float32), 1.0 / vc.RATE, 0.0)
+    np.testing.assert_allclose(out, raw, atol=1e-6)
+    assert alpha == 1.0
+
+
+def test_lowpass_first_step_initialises_to_raw():
+    """第 0 步必须等于 raw，否则手臂会从 0 猛冲到目标。"""
+    raw = np.array([0.4] * 14, np.float32)
+    out, alpha = vc.lowpass_target(raw, None, 1.0 / vc.RATE, 0.1)
+    np.testing.assert_allclose(out, raw, atol=1e-6)
+    assert alpha == 1.0
+
+
+def test_lowpass_step_response_converges():
+    """阶跃输入应在若干时间常数内收敛到目标。"""
+    tgt = np.array([0.5] * 14, np.float32)
+    sm = np.zeros(14, np.float32)
+    tau = 0.1
+    for _ in range(int(5.0 * tau * vc.RATE) + 5):     # 5 tau
+        sm, _ = vc.lowpass_target(tgt, sm, 1.0 / vc.RATE, tau)
+    assert abs(float(sm[0]) - 0.5) < 0.01, f"5 tau 后应基本到位，实际 {sm[0]}"
+
+
+def test_lowpass_attenuates_chunk_frequency_oscillation():
+    """1.9 Hz（换段频率）±20° 抖动应被显著衰减 —— 这是治震动的核心指标。"""
+    tau = 0.12
+    freq = 16.0 / vc.RATE            # 每 16 步一个周期 = 1.875 Hz
+    sm = None
+    amps = []
+    n = int(4.0 / freq) * 16         # 至少 4 个周期
+    for k in range(400):
+        raw = np.full(14, np.deg2rad(20.0) * np.sin(2 * np.pi * freq * k), np.float32)
+        sm, _ = vc.lowpass_target(raw, sm, 1.0 / vc.RATE, tau)
+    # 稳态后再统计峰值
+    peak = 0.0
+    for k in range(200):
+        raw = np.full(14, np.deg2rad(20.0) * np.sin(2 * np.pi * freq * (400 + k)), np.float32)
+        sm, _ = vc.lowpass_target(raw, sm, 1.0 / vc.RATE, tau)
+        peak = max(peak, abs(float(sm[0])))
+    atten = peak / np.deg2rad(20.0)
+    assert atten < 0.45, f"衰减不够：剩余 {atten*100:.0f}%（期望 <45%）"
+    assert atten > 0.05, f"衰减过度（跟随会太迟钝）：剩余 {atten*100:.0f}%"
+
+
+def test_lowpass_bad_dt_falls_back_to_nominal():
+    raw = np.ones(14, np.float32) * 0.5
+    sm = np.zeros(14, np.float32)
+    for dt in (0.0, -1.0, 5.0):
+        out, alpha = vc.lowpass_target(raw, sm, dt, 0.1)
+        expected = 1.0 / vc.RATE / (0.1 + 1.0 / vc.RATE)
+        assert abs(alpha - expected) < 1e-6, f"dt={dt} alpha={alpha}"
+
 # ── 会话可用性等待（patch 18：刚释放后立刻接管会被拒）──────────────────────
 
 class _FakeSafety:
