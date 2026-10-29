@@ -156,7 +156,14 @@ STILL_EPS_DEG = 0.3             # 判定"不动"的单步阈值（度）
 #   N 给一点余量让手臂先抬离物体，建议 45（1.5 秒）。
 #   要求抓取阶段闭合至少 STOP_AFTER_RELEASE_MIN_CLOSED 步，避免初始张开被误判。
 STOP_AFTER_RELEASE_STEPS = 0        # 0 = 关闭；建议 45
-STOP_AFTER_RELEASE_MIN_CLOSED = 10  # 释放前至少闭合过多少步
+STOP_AFTER_RELEASE_MIN_CLOSED = 30  # 释放前必须「完全闭合」持续多少步（1 秒）
+# ★ 收紧判据（2026-10-29 22:12 实测误判）：原来只看夹爪值是否跨过 0.5，
+#   结果模型在搬运途中动了一下夹爪就被当成"放置完成"，221 步(7.4s)就砍了任务，
+#   而方块还在爪里没放下。现在要求三件事同时成立：
+RELEASE_OPEN_V = 0.80       #   ① 夹爪张开到 >0.8
+RELEASE_CLOSED_V = 0.30     #   ② 之前闭合到 <0.3 且持续 MIN_CLOSED 步
+RELEASE_OPEN_HOLD = 10      #   ③ 张开后要持续 ≥10 步（防瞬动）
+RELEASE_MIN_TRANSPORT_DEG = 10.0  # ④ 释放时臂姿态距抓取姿态 ≥10°（真搬动了）
 
 # 退出码：0 = 正常跑完；>=2 = 被安全停机制中断（上层脚本据此判失败）
 EXIT_OK = 0
@@ -844,8 +851,11 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
     sanity_bad = 0            # 连续超偏差步数（patch 16）
     prev_delta = None         # 上一步位移向量（patch 16 振荡检测）
     osc_count = 0             # 连续方向反转次数（patch 16）
-    # patch 22：夹爪释放检测状态
-    grip_closed_steps = {j: 0 for j in GRIPPER_JOINTS}   # 每个夹爪连续闭合步数
+    # patch 22/23：夹爪释放检测状态
+    grip_closed_steps = {j: 0 for j in GRIPPER_JOINTS}   # 当前连续闭合步数
+    grip_open_steps = {j: 0 for j in GRIPPER_JOINTS}     # 当前连续张开步数
+    grip_last_closed = {j: 0 for j in GRIPPER_JOINTS}    # 最近一次闭合持续了多少步
+    grasp_pose = {j: None for j in GRIPPER_JOINTS}       # 抓稳时的臂姿态
     release_step = None                                  # 释放事件发生的步号
     prev_raw = None           # 上一步的模型原始输出（patch 21）
     still_count = 0           # 连续"模型输出不动"步数（patch 21）
@@ -969,24 +979,54 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
         # ── ★ patch 10：执行层限速（这一条是"夹飞"/"换段乱动"的核心修复）──
         # 夹爪：0.7/s（0→1 需 1.43 s，对齐 yam_motion 的 gripper_rate_limit）
         # 臂  ：2.5 rad/s（143°/s，只裁剪换段尖峰，不干扰正常跟随）
-        # ── ★ patch 22：夹爪释放即停（任务感知）──────────────────────────
+        # ── ★ patch 22/24：夹爪释放即停（任务感知，四条件同时成立）──────────
         # 用【限速后的命令值】判断夹爪开合，它才反映真实物理状态。
+        # 状态机：闭合累计 → 转入张开时把闭合时长"冻结"到 grip_last_closed
+        #   （关键：不能一进张开就把计数清零，否则永远无法通过时长校验）
         if stop_after_release > 0:
             for _j in GRIPPER_JOINTS:
                 _v = float(target[_j])
-                if _v < 0.5:                       # 闭合中
+                if _v < RELEASE_CLOSED_V:                    # ① 完全闭合
                     grip_closed_steps[_j] += 1
-                else:                              # 张开了
+                    grip_open_steps[_j] = 0
+                    if grip_closed_steps[_j] == STOP_AFTER_RELEASE_MIN_CLOSED:
+                        # 夹稳了：记下当时的臂姿态，后面判断"有没有搬动"
+                        grasp_pose[_j] = last["t"][list(ARM_JOINTS)].copy()
+                elif _v > RELEASE_OPEN_V:                    # ② 完全张开
+                    if grip_open_steps[_j] == 0 and grip_closed_steps[_j] > 0:
+                        grip_last_closed[_j] = grip_closed_steps[_j]   # 冻结
+                    grip_open_steps[_j] += 1
                     if (release_step is None
-                            and grip_closed_steps[_j] >= STOP_AFTER_RELEASE_MIN_CLOSED):
-                        release_step = step
-                        logger.info("检测到夹爪 #%d 释放（之前闭合了 %d 步）→ "
-                                    "任务放置完成，再跑 %d 步（%.1fs）就结束",
-                                    _j, grip_closed_steps[_j], stop_after_release,
-                                    stop_after_release / RATE)
+                            and grip_open_steps[_j] == RELEASE_OPEN_HOLD):
+                        # ③ 张开已持续到阈值；④ 之前夹稳过；⑤ 真的搬动了
+                        _why = []
+                        if grip_last_closed[_j] < STOP_AFTER_RELEASE_MIN_CLOSED:
+                            _why.append(f"闭合仅 {grip_last_closed[_j]} 步"
+                                        f"(需{STOP_AFTER_RELEASE_MIN_CLOSED})")
+                        if grasp_pose[_j] is None:
+                            _why.append("没记录到抓取姿态")
+                            _move = 0.0
+                        else:
+                            _move = float(np.rad2deg(np.max(np.abs(
+                                last["t"][list(ARM_JOINTS)] - grasp_pose[_j]))))
+                            if _move < RELEASE_MIN_TRANSPORT_DEG:
+                                _why.append(f"只搬了 {_move:.1f}°"
+                                            f"(需{RELEASE_MIN_TRANSPORT_DEG:.0f}°)")
+                        if _why:
+                            logger.info("夹爪 #%d 张开了但不算完成：%s —— 继续跑",
+                                        _j, "；".join(_why))
+                        else:
+                            release_step = step - RELEASE_OPEN_HOLD + 1
+                            logger.info("★ 夹爪 #%d 释放且已搬运 %.1f°"
+                                        "（闭合 %d 步、张开已 %d 步）→ 判定放置完成，"
+                                        "再跑 %d 步（%.1fs）结束",
+                                        _j, _move, grip_last_closed[_j],
+                                        grip_open_steps[_j], stop_after_release,
+                                        stop_after_release / RATE)
                     grip_closed_steps[_j] = 0
+                # 介于 CLOSED_V~OPEN_V 之间是过渡态：两个计数都不动
             if release_step is not None and (step - release_step) >= stop_after_release:
-                logger.info("夹爪释放后已过 %d 步（%.2fs）→ 判定任务完成，正常结束"
+                logger.info("释放后已过 %d 步（%.2fs）→ 任务完成，正常结束"
                             "（剩余回位交给确定性的复位脚本）",
                             step - release_step, (step - release_step) / RATE)
                 break
