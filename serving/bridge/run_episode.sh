@@ -24,7 +24,8 @@ TASK_ID=${TASK_ID:-TASK-YAM-0006}
 DURATION=${DURATION:-40}           # 宽松上限；通常 --stop-when-still 会提前结束
 ARM_SPEED=${ARM_SPEED:-1.0}       # rad/s，57°/s。>1.5 会因 0.53s 延迟而震荡
 LP_TAU=${LP_TAU:-0.10}            # 命令低通时间常数，压高频抖动
-STILL=${STILL:-60}                # 模型输出连续多少步不变就正常结束（60=2秒）
+STILL=${STILL:-60}                # 模型输出连续多少步不变就正常结束（兜底，60=2秒）
+RELEASE_STOP=${RELEASE_STOP:-45}  # 夹爪释放后再跑多少步就停（45=1.5秒）——主结束条件
 HOME_SPEED=${HOME_SPEED:-0.12}    # 复位速度 rad/s，6.9°/s
 HOME_WAIT=${HOME_WAIT:-3}         # 策略结束后等几秒再申请会话（守护进程需~1s判心跳失效）
 RESET=${RESET:-1}                 # 1=跑完复位；0=不复位
@@ -52,7 +53,7 @@ unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy 2>/dev/n
 
 say "G0.5 × YAM 真机试验   ${STAMP}"
 say "  任务        : $TASK_ID"
-say "  时长上限    : ${DURATION}s（模型稳定后自动提前结束，连续 ${STILL} 步不动）"
+say "  时长上限    : ${DURATION}s（夹爪释放后 ${RELEASE_STOP} 步即停；兜底：连续 ${STILL} 步不动）"
 say "  臂限速      : ${ARM_SPEED} rad/s"
 say "  低通 tau    : ${LP_TAU}s"
 say "  跑完复位    : $([ "$RESET" = "1" ] && echo "是 (${HOME_SPEED} rad/s)" || echo "否")"
@@ -109,7 +110,7 @@ if [ "$DRY" = "1" ]; then
     say "      --camera-config \"$D/live_configs/robot.yaml\" \\"
     say "      --motion-src \"$D/code/motion/src\" \\"
     say "      --arm-max-speed-rad-s $ARM_SPEED --cmd-lowpass-tau $LP_TAU \\"
-    say "      --stop-when-still $STILL \\"
+    say "      --stop-after-release $RELEASE_STOP --stop-when-still $STILL \\"
     say "      --log-csv \"$CSV\" --duration $DURATION --verbose"
 else
     head1 "4/5 跑策略（上限 ${DURATION}s，稳定即停）—— 急停在手边"
@@ -121,6 +122,7 @@ else
         --motion-src    "$D/code/motion/src" \
         --arm-max-speed-rad-s "$ARM_SPEED" \
         --cmd-lowpass-tau "$LP_TAU" \
+        --stop-after-release "$RELEASE_STOP" \
         --stop-when-still "$STILL" \
         --log-csv "$CSV" \
         --duration "$DURATION" --verbose 2>&1 | tee "$LOG" | tail -25

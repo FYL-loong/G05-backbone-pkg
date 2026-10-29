@@ -148,6 +148,16 @@ CMD_LOWPASS_TAU_S = 0.0        # 0 = 关闭（默认不改变现有行为）
 STOP_WHEN_STILL_STEPS = 0       # 0 = 关闭；建议 60（=2 秒）
 STILL_EPS_DEG = 0.3             # 判定"不动"的单步阈值（度）
 
+# ★ patch 22：夹爪释放即停（任务感知的结束条件）
+# 问题：--stop-when-still 是被动等模型安静 —— 实测任务约 18~20s 完成后，
+#   模型还会"做一些动作" 13 秒才安静，于是 stop-when-still 到 33s 才触发。
+#   这 13 秒的乱动既浪费又无意义（复位脚本会把手臂精确带回 home）。
+# 做法：夹爪闭合(抓取) → 张开(放置) 的【释放事件】发生后再等 N 步就正常结束。
+#   N 给一点余量让手臂先抬离物体，建议 45（1.5 秒）。
+#   要求抓取阶段闭合至少 STOP_AFTER_RELEASE_MIN_CLOSED 步，避免初始张开被误判。
+STOP_AFTER_RELEASE_STEPS = 0        # 0 = 关闭；建议 45
+STOP_AFTER_RELEASE_MIN_CLOSED = 10  # 释放前至少闭合过多少步
+
 # 退出码：0 = 正常跑完；>=2 = 被安全停机制中断（上层脚本据此判失败）
 EXIT_OK = 0
 EXIT_UNHEALTHY = 2
@@ -797,6 +807,7 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
                 output_osc_deg=OUTPUT_OSC_DEG,
                 output_osc_trip=OUTPUT_OSC_TRIP,
                 cmd_tau=CMD_LOWPASS_TAU_S,
+                stop_after_release=STOP_AFTER_RELEASE_STEPS,
                 stop_still_steps=STOP_WHEN_STILL_STEPS,
                 still_eps_deg=STILL_EPS_DEG):
     """主循环。``last`` 是 ``{"t": ndarray}`` 的可变容器（上一帧命令的目标）。
@@ -833,6 +844,9 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
     sanity_bad = 0            # 连续超偏差步数（patch 16）
     prev_delta = None         # 上一步位移向量（patch 16 振荡检测）
     osc_count = 0             # 连续方向反转次数（patch 16）
+    # patch 22：夹爪释放检测状态
+    grip_closed_steps = {j: 0 for j in GRIPPER_JOINTS}   # 每个夹爪连续闭合步数
+    release_step = None                                  # 释放事件发生的步号
     prev_raw = None           # 上一步的模型原始输出（patch 21）
     still_count = 0           # 连续"模型输出不动"步数（patch 21）
     moved_deg = 0.0           # 累计最大单步位移（用于启用稳定检测）
@@ -955,6 +969,27 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
         # ── ★ patch 10：执行层限速（这一条是"夹飞"/"换段乱动"的核心修复）──
         # 夹爪：0.7/s（0→1 需 1.43 s，对齐 yam_motion 的 gripper_rate_limit）
         # 臂  ：2.5 rad/s（143°/s，只裁剪换段尖峰，不干扰正常跟随）
+        # ── ★ patch 22：夹爪释放即停（任务感知）──────────────────────────
+        # 用【限速后的命令值】判断夹爪开合，它才反映真实物理状态。
+        if stop_after_release > 0:
+            for _j in GRIPPER_JOINTS:
+                _v = float(target[_j])
+                if _v < 0.5:                       # 闭合中
+                    grip_closed_steps[_j] += 1
+                else:                              # 张开了
+                    if (release_step is None
+                            and grip_closed_steps[_j] >= STOP_AFTER_RELEASE_MIN_CLOSED):
+                        release_step = step
+                        logger.info("检测到夹爪 #%d 释放（之前闭合了 %d 步）→ "
+                                    "任务放置完成，再跑 %d 步（%.1fs）就结束",
+                                    _j, grip_closed_steps[_j], stop_after_release,
+                                    stop_after_release / RATE)
+                    grip_closed_steps[_j] = 0
+            if release_step is not None and (step - release_step) >= stop_after_release:
+                logger.info("夹爪释放后已过 %d 步（%.2fs）→ 判定任务完成，正常结束"
+                            "（剩余回位交给确定性的复位脚本）",
+                            step - release_step, (step - release_step) / RATE)
+                break
         # ── ★ patch 21：稳定即停（不靠猜时长）────────────────────────────
         # 判据用【模型原始输出】的步间变化，不受限速和滤波影响。
         # 启用条件：step >= 60（跑过 2 秒）且已出现过 >3° 的动作 ——
@@ -1356,6 +1391,7 @@ async def run(args) -> int:
         output_osc_trip=int(args.output_osc_trip),
         cmd_tau=float(args.cmd_lowpass_tau),
         stop_still_steps=int(args.stop_when_still),
+        stop_after_release=int(args.stop_after_release),
     )
     logger.info("执行层配置：夹爪限速 %.2f/s，臂限速 %.2f rad/s，相机停顿阈值 %.1fs",
                 loop_kw["gripper_rate"], loop_kw["arm_speed"], loop_kw["cam_stall_abort"])
@@ -1480,6 +1516,9 @@ def main():
     ap.add_argument("--output-sanity-deg", type=float, default=OUTPUT_SANITY_DEG,
                     help="看门狗：单关节目标偏离当前姿态超过这个角度视为模型输出异常"
                          "（默认 60°，正常跟踪实测 p95<3°）；0 = 关闭")
+    ap.add_argument("--stop-after-release", type=int, default=STOP_AFTER_RELEASE_STEPS,
+                    help="夹爪「闭合→张开」（放置释放）后再跑 N 步就正常结束，N 建议 45（1.5s）。"
+                         "这是任务感知的结束条件，比等模型自己安静可靠。0=关闭")
     ap.add_argument("--stop-when-still", type=int, default=STOP_WHEN_STILL_STEPS,
                     help="模型输出连续 N 步几乎不变（<0.3°）就正常结束，不用猜 --duration。"
                          "建议 60（2 秒）。0=关闭。配合较宽松的 --duration（如 40）使用")
