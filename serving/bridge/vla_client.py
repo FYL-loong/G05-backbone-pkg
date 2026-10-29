@@ -670,7 +670,8 @@ def _ws_connect(uri: str):
 async def _loop(ws, robot, cameras, task, steps, duration, limits,
                 jump_warn, max_step, latencies, t_run0, last,
                 gripper_rate=GRIPPER_RATE_LIMIT_S, arm_speed=ARM_MAX_SPEED_RAD_S,
-                cam_stall_abort=CAMERA_STALL_ABORT_S, csv_writer=None):
+                cam_stall_abort=CAMERA_STALL_ABORT_S, csv_writer=None,
+                freeze_logger=None):
     """主循环。``last`` 是 ``{"t": ndarray}`` 的可变容器（上一帧命令的目标）。
 
     返回 (exit_code, step, behind, stats)。
@@ -701,6 +702,9 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
     cam_misses_total = 0
     grip_clip_steps = 0
     arm_clip_steps = 0
+    images_for_log = None     # 最近一次真实观测的画面（patch 15）
+    freeze_steps = 0          # 连续"几乎不动"的步数（patch 15 诊断）
+    freeze_reports = 0
 
     while True:
         if steps > 0 and step >= steps:
@@ -763,6 +767,7 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
                 next_tick = time.monotonic()          # 等待期间时钟已滞后，重对齐
             images, _frame_ts = cam
             obs = build_obs(state, images, task, RATE)
+            images_for_log = images      # 冻结时要把这份画面存下来（patch 15）
         else:
             obs = {}
 
@@ -840,6 +845,24 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
             if jump2 > max_step:
                 target[ARM_JOINTS] = last["t"][ARM_JOINTS] + delta2 * (max_step / jump2)
 
+                # ── ★ patch 15：冻结检测（诊断"抓住后停在半空不动"）──────────────
+        # 判定：本步模型原始输出相对上一步命令的位移 < 0.5° 且持续 ≥ 1 秒。
+        # 命中时调用 freeze_logger（会存下"模型看到的三路画面"），每段只报一次。
+        _raw_jump = float(np.max(np.abs(raw_target - last["t"])))
+        if np.rad2deg(_raw_jump) < 0.5:
+            freeze_steps += 1
+        else:
+            if freeze_steps >= int(1.0 * RATE):     # 刚结束一段冻结
+                logger.warning("冻结结束：之前连续 %.1f 秒模型输出几乎不动（累计 %d 段）",
+                               freeze_steps / RATE, freeze_reports)
+            freeze_steps = 0
+        if freeze_steps == int(1.0 * RATE) and freeze_logger is not None:
+            freeze_reports += 1
+            try:
+                freeze_logger(step, images_for_log)
+            except Exception as exc:                # noqa: BLE001
+                logger.debug("freeze_logger 失败：%s", exc)
+
         if limits is not None:
             target = np.clip(target, limits[:, 0], limits[:, 1])
         target = target.astype(np.float32)
@@ -882,6 +905,7 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
         "cam_misses": cam_misses_total,
         "gripper_clipped_steps": grip_clip_steps,
         "arm_clipped_steps": arm_clip_steps,
+        "freeze_reports": freeze_reports,
     }
 
 
@@ -1080,11 +1104,32 @@ async def run(args) -> int:
         csv_fh = open(csv_path, "w", encoding="utf-8")
         logger.info("CSV 诊断日志：%s（每步一行，含 raw_target/cmd_target/跳变/换段标记）",
                     csv_path)
+    # ★ patch 15：冻结时存画面
+    freeze_logger = None
+    snap_dir = getattr(args, "snapshot_on_freeze", None)
+    if snap_dir:
+        from pathlib import Path
+        Path(snap_dir).mkdir(parents=True, exist_ok=True)
+
+        def freeze_logger(step, images):                 # noqa: ANN001
+            if images is None:
+                logger.warning("冻结但还没有真实画面可存（step %d）", step)
+                return
+            saved = []
+            for key, chw in images.items():
+                hwc = np.ascontiguousarray(np.transpose(chw, (1, 2, 0)))
+                pth = Path(snap_dir) / f"freeze_step{step:04d}_{key}.png"
+                if _save_png(str(pth), hwc):
+                    saved.append(pth.name)
+            logger.warning("❄️ 模型连续 1 秒几乎不动（step %d）→ 已存画面：%s",
+                           step, ", ".join(saved) if saved else "（存图失败）")
+
     loop_kw = dict(
         gripper_rate=float(args.gripper_rate_limit),
         arm_speed=float(args.arm_max_speed_rad_s),
         cam_stall_abort=float(args.camera_stall_abort_s),
         csv_writer=csv_fh,
+        freeze_logger=freeze_logger,
     )
     logger.info("执行层配置：夹爪限速 %.2f/s，臂限速 %.2f rad/s，相机停顿阈值 %.1fs",
                 loop_kw["gripper_rate"], loop_kw["arm_speed"], loop_kw["cam_stall_abort"])
@@ -1154,10 +1199,11 @@ async def run(args) -> int:
                         np.percentile(arr, 99), arr.max())
         logger.info("steps completed=%d behind_schedule=%d", step, behind)
         if stats:
-            logger.info("执行层统计：相机丢帧恢复 %d 次；夹爪被限速 %d 步；臂被限速 %d 步",
+            logger.info("执行层统计：相机丢帧恢复 %d 次；夹爪被限速 %d 步；臂被限速 %d 步；冻结段 %d 段",
                         stats.get("cam_misses", 0),
                         stats.get("gripper_clipped_steps", 0),
-                        stats.get("arm_clipped_steps", 0))
+                        stats.get("arm_clipped_steps", 0),
+                        stats.get("freeze_reports", 0))
             if stats.get("arm_clipped_steps", 0):
                 logger.warning("臂限速生效了 %d 步 —— 说明换段确实有跳变，"
                                "已被平滑；若仍觉动作生硬可调小 --arm-max-speed-rad-s",
@@ -1205,6 +1251,9 @@ def main():
     ap.add_argument("--session-dry", action="store_true",
                     help="配合 --session-test：只申请/持有/释放安全会话，"
                          "**一条运动指令都不下发**（最保守的一步）")
+    ap.add_argument("--snapshot-on-freeze", default=None, metavar="DIR",
+                    help="运行中检测到模型连续 1 秒几乎不动时，把当时的三路画面存成 PNG"
+                         "（诊断「夹住后停住」用）")
     ap.add_argument("--save-frames", default=None, metavar="DIR",
                     help="配合 --camera-test：把最后一批帧存成 PNG（看现场用）")
     ap.add_argument("--camera-test", action="store_true",
