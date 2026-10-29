@@ -1137,11 +1137,21 @@ def session_test(args) -> int:
     try:
         with robot.motion_session():
             period = 1.0 / RATE
+            # ★ patch 19：用 deadline 对齐而不是"干完活再 sleep(period)"。
+            #   旧写法实际周期 = 工作耗时 + 33ms（实测只有 19.9Hz），
+            #   会误报"命令频率偏低"，让人以为是 ZMQ 太慢。
+            next_tick = time.monotonic()
+            behind = 0
             if dry:
                 print(f"  ✅ 会话已激活（DRY 模式：{secs:.1f}s 内不下发任何指令）")
                 while time.monotonic() - t_begin < secs:
                     robot.check()                   # 只维护心跳，不发命令
-                    time.sleep(period)
+                    next_tick += period
+                    d = next_tick - time.monotonic()
+                    if d > 0:
+                        time.sleep(d)
+                    else:
+                        behind += 1
             else:
                 print("  ✅ 会话已激活，开始 30Hz 命令当前位置")
                 while time.monotonic() - t_begin < secs:
@@ -1151,7 +1161,12 @@ def session_test(args) -> int:
                         dtype=np.float32).reshape(-1)
                     robot.command_joint_state(pos)  # 命令到"当前位置" ≈ 不动
                     n += 1
-                    time.sleep(period)
+                    next_tick += period
+                    d = next_tick - time.monotonic()
+                    if d > 0:
+                        time.sleep(d)
+                    else:
+                        behind += 1
     except Exception as exc:  # noqa: BLE001
         print(f"  ❌ 会话中断：{type(exc).__name__}: {exc}")
         rc = EXIT_UNHEALTHY
@@ -1164,7 +1179,10 @@ def session_test(args) -> int:
             st1 = {}
         robot.close(disable_motors=False)
 
-    print(f"\n  命令次数 = {n}   用时 = {dt:.1f}s   有效频率 = {(n / dt if dt else 0):.1f} Hz" + ("  (DRY：一条命令都没发)" if n == 0 else ""))
+    _hz = (n / dt) if dt else 0.0
+    print(f"\n  命令次数 = {n}   用时 = {dt:.1f}s   有效频率 = {_hz:.1f} Hz"
+          + ("  (DRY：一条命令都没发)" if n == 0 else "")
+          + (f"   落后 {behind} 次" if n else ""))
     print(f"  释放后：state={st1.get('state')!r} hold_confirmed={st1.get('hold_confirmed')} "
           f"reason={str(st1.get('reason'))[:80]!r}")
     if st1.get("state") != "safe_hold":
