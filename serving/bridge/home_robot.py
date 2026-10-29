@@ -81,7 +81,8 @@ def converge(robot, target: np.ndarray, speed: float, gripper_speed: float,
         robot.check()
         err = np.abs(cur[arm_idx] - target[arm_idx]).max()
         if err < tol_rad and (not move_gripper or
-                              np.abs(cur[vc.GRIPPER_JOINTS] - target[vc.GRIPPER_JOINTS]).max()
+                              np.abs(cur[list(vc.GRIPPER_JOINTS)]
+                                     - target[list(vc.GRIPPER_JOINTS)]).max()
                               < 0.02):
             print(f"  [{label}] ✅ 收敛（最大误差 {np.rad2deg(err):.2f}°，{step} 步 / "
                   f"{time.monotonic()-t0:.1f}s）")
