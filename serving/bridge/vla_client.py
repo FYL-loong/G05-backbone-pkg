@@ -885,15 +885,34 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
     }
 
 
+def _save_png(path: str, hwc_rgb: np.ndarray) -> bool:
+    """保存一帧 RGB HWC uint8 到 PNG（cv2 优先，PIL 兜底）。"""
+    try:
+        import cv2
+        cv2.imwrite(path, cv2.cvtColor(hwc_rgb, cv2.COLOR_RGB2BGR))
+        return True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from PIL import Image
+        Image.fromarray(hwc_rgb).save(path)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.error("存 PNG 失败（cv2/PIL 都不可用）：%s", exc)
+        return False
+
+
 def camera_test(args) -> int:
     """相机只读测试：开 3 路、采 30 帧、打印形状/均值/耗时。
 
     ⭐ 全零帧 = 相机没真正出图（或曝光全黑），要单独排查。
+    ``--save-frames DIR`` 会把最后一批帧存成 PNG（看现场用）。
     """
     cam = RealCameras(args.camera_config, args.motion_src)
     print(f"  打开相机：{args.camera_config}")
     cam.start()
     ok = 0
+    last_images = None
     try:
         for i in range(30):
             t0 = time.monotonic()
@@ -911,11 +930,31 @@ def camera_test(args) -> int:
                     print(f"  [{i:02d}] ❌ 形状/类型不符：{bad}  {shapes}")
                 else:
                     ok += 1
+                    last_images = images
                     print(f"  [{i:02d}] ✅ ts={ts:.3f} means={means} 耗时={dt:.1f}ms")
             time.sleep(max(0.0, 1.0 / RATE - (time.monotonic() - t0)))
     finally:
         cam.close()
     print(f"\n  通过 {ok}/30 帧")
+
+    save_dir = getattr(args, "save_frames", None)
+    if save_dir and last_images is not None:
+        from pathlib import Path
+        d = Path(save_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        saved = []
+        for key, chw in last_images.items():
+            hwc = np.ascontiguousarray(np.transpose(chw, (1, 2, 0)))  # CHW→HWC
+            p = d / f"{key}.png"
+            if _save_png(str(p), hwc):
+                saved.append(str(p))
+        if saved:
+            print("  📷 已存现场图：")
+            for p in saved:
+                print(f"       {p}")
+        else:
+            print("  ⚠️ 存图失败（cv2/PIL 都不可用）")
+
     if ok < 25:
         print("  ❌ 相机不合格（帧率或形状不过关），先修相机再做闭环")
         return EXIT_CAMERA_STALE
@@ -1166,6 +1205,8 @@ def main():
     ap.add_argument("--session-dry", action="store_true",
                     help="配合 --session-test：只申请/持有/释放安全会话，"
                          "**一条运动指令都不下发**（最保守的一步）")
+    ap.add_argument("--save-frames", default=None, metavar="DIR",
+                    help="配合 --camera-test：把最后一批帧存成 PNG（看现场用）")
     ap.add_argument("--camera-test", action="store_true",
                     help="相机只读测试：开 3 路、采 30 帧、打印形状/均值/耗时")
 
