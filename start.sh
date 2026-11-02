@@ -1617,6 +1617,201 @@ do_serve_check() {
 EOF
 }
 
+do_eval_codec() {
+    # ================================================================
+    # codec-only 对比：**同一 backbone、同一 stats、同一数据管线**，只换 codec
+    #
+    # 要回答的问题：把张恩同微调过的 YAM codec 换成官方原版 codec，
+    #               在**同一个**微调 backbone 上，开环指标会变差多少？
+    #
+    # 为什么需要独立模式：
+    #   do_eval 的 A/B 是【整机对比】—— A=微调backbone+YAMcodec+YAMstats，
+    #   B=官方backbone+官方codec+官方stats。backbone/codec/stats 三个变量一起变，
+    #   无法归因到 codec。本模式把 backbone 与 stats 固定成 A，只动 codec。
+    #
+    # 两个 codec 的尺寸指纹（用来断言文件没拿错/没损坏）：
+    #   微调 YAM codec  checkpoints/action_tokenizer_yam.pt  169,709,565 B
+    #   官方原版 codec  checkpoints/action_tokenizer.pt      506,886,775 B
+    #   （官方那份是训练 checkpoint：权重 + optimizer + scheduler，所以约 3 倍大）
+    #
+    # 产物（互不覆盖）：
+    #   $PREPARED_RUN_DIR/_codecab/A_codecYAM/metrics.json
+    #   $PREPARED_RUN_DIR/_codecab/B_codecOFFICIAL/metrics.json
+    #   eval_logs/eval_codec_A.log / eval_codec_B.log
+    #   HF: eval/codecab/<N>ep/{A,B}/metrics.json
+    # ================================================================
+    require_hf_token
+    activate_venv
+
+    local ne="${EVAL_EPISODES:-20}"
+    local YAM_CODEC="$PROJECT_ROOT/checkpoints/action_tokenizer_yam.pt"
+    local OFF_CODEC="$PROJECT_ROOT/checkpoints/action_tokenizer.pt"
+    local logd="$PROJECT_ROOT/eval_logs"
+    mkdir -p "$logd"
+
+    step "0. 前置检查（codec-only 对比）"
+    [[ -x .venv/bin/python ]] || fail "没有 .venv —— 先跑 MODE=setup"
+    [[ -f "$YAM_CODEC" ]] || fail "缺少微调 codec $YAM_CODEC —— 先跑 MODE=setup"
+    [[ -f "$OFF_CODEC" ]] || fail "缺少官方 codec $OFF_CODEC —— 先跑 MODE=setup"
+
+    local yam_sz off_sz
+    yam_sz="$(stat -c%s "$YAM_CODEC" 2>/dev/null || echo 0)"
+    off_sz="$(stat -c%s "$OFF_CODEC" 2>/dev/null || echo 0)"
+    info "codec 尺寸指纹："
+    info "  微调(YAM)  $yam_sz B   期望 169709565"
+    info "  官方原版   $off_sz B   期望 506886775"
+    [[ "$yam_sz" == "169709565" ]] || fail "微调 codec 尺寸不符（实际 $yam_sz）—— 文件可能损坏或下错"
+    [[ "$off_sz" == "506886775" ]] || fail "官方 codec 尺寸不符（实际 $off_sz）—— 文件可能不完整"
+    ok "两个 codec 尺寸指纹都对"
+
+    # 组装 run 目录（我们的 backbone + YAM stats + 链式插值展开，默认 codec=YAM）
+    prepare_yam_run_dir
+    local R="$PREPARED_RUN_DIR"
+    local C="$PREPARED_CKPT"
+    local outroot="$R/_codecab"
+    mkdir -p "$outroot"
+
+    # ---- 单次评测（内联函数，避免重复代码）
+    #   $1=tag(A_codecYAM/B_codecOFFICIAL)  $2=codec 绝对路径  $3=日志路径
+    # 返回：把 metrics.json 放到 $outroot/$1/metrics.json
+    _codecab_one() {
+        local tag="$1" codec="$2" log="$3"
+        rm -f "$log"
+        # 清掉上一轮遗留的评测输出，避免 find 拿到旧 metrics
+        rm -rf "$R/eval_model_state_dict"
+
+        info "命令：eval_open_loop.sh --ckpt_path <同一 backbone> eval_episodes_num=$ne \\"
+        info "        ckpt_dir=$codec   （tokenizer / model.tokenizer / AT_CONFIG 三处一起 override）"
+        set +e
+        bash scripts/run/eval_open_loop.sh \
+            --ckpt_path "$C" \
+            "eval_episodes_num=$ne" \
+            "tokenizer.vq_config.ckpt_dir=$codec" \
+            "model.tokenizer.vq_config.ckpt_dir=$codec" \
+            "model.model_arch.AT_CONFIG.ckpt_dir=$codec" \
+            2>&1 | tee "$log"
+        local rc=${PIPESTATUS[0]}
+        set -e
+        if [[ $rc -ne 0 ]]; then
+            warn "$tag 评测失败（rc=$rc），日志：$log"
+            tail -40 "$log" 2>/dev/null || true
+            return 1
+        fi
+
+        # ---- 自检：确认真的加载了期望的 codec
+        # ⚠️ 必须先去换行再 grep：平台日志按 ~80 字符折行，路径会被切断
+        local used want
+        used="$(tr -d '\n' < "$log" 2>/dev/null \
+                | grep -oE 'action_tokenizer[a-z_]*\.pt' | tail -1 || true)"
+        if [[ "$tag" == "A_codecYAM" ]]; then
+            want="action_tokenizer_yam.pt"
+        else
+            want="action_tokenizer.pt"
+        fi
+        if [[ "$used" == "$want" ]]; then
+            ok "$tag 自检通过：实际加载 $used"
+        elif [[ -z "$used" ]]; then
+            warn "$tag 自检：日志里没解析到 codec 文件名（可能是折行/版本差异），继续"
+        else
+            warn "★★ $tag 加载的 codec 是 $used，与期望 $want 不符 —— 本次对比不可信"
+            return 1
+        fi
+
+        local met
+        met="$(find "$R/eval_model_state_dict" -maxdepth 2 -name metrics.json -print -quit 2>/dev/null || true)"
+        if [[ -z "$met" || ! -f "$met" ]]; then
+            warn "$tag 没产出 metrics.json（在 $R/eval_model_state_dict 下未找到）"
+            return 1
+        fi
+        mkdir -p "$outroot/$tag"
+        cp -f "$met" "$outroot/$tag/metrics.json"
+        ok "$tag 完成 → $outroot/$tag/metrics.json"
+        return 0
+    }
+
+    # ---------------------------------------------------------------- A：我们的 codec
+    step "1. 评测 A（同一微调 backbone + 【微调 YAM codec】），${ne} 条 episode"
+    local A_LOG="$logd/eval_codec_A.log"
+    local A_OK=0 B_OK=0
+    if _codecab_one "A_codecYAM" "$YAM_CODEC" "$A_LOG"; then
+        A_OK=1
+    else
+        A_OK=0
+    fi
+    [[ $A_OK -eq 1 ]] || fail "A（YAM codec）评测失败，无法继续"
+
+    # ---------------------------------------------------------------- B：官方 codec
+    step "2. 评测 B（同一微调 backbone + 【官方原版 codec】），${ne} 条 episode"
+    local B_LOG="$logd/eval_codec_B.log"
+    if _codecab_one "B_codecOFFICIAL" "$OFF_CODEC" "$B_LOG"; then
+        B_OK=1
+    else
+        B_OK=0
+    fi
+
+    local A_MET="$outroot/A_codecYAM/metrics.json"
+    local B_MET="$outroot/B_codecOFFICIAL/metrics.json"
+
+    # ---------------------------------------------------------------- 可比性自检
+    step "3. 可比性自检"
+    ok "两个 run 用的是【同一个】backbone：$C"
+    ok "两个 run 用的是【同一个】run 目录（因此同一 dataset_stats.json、同一 hydra 配置）"
+    info "唯一差异：tokenizer.vq_config.ckpt_dir / model.tokenizer.vq_config.ckpt_dir / model.model_arch.AT_CONFIG.ckpt_dir"
+    if [[ -f "$A_LOG" && -f "$B_LOG" ]]; then
+        local a_tot b_tot
+        a_tot="$(tr -d '\n' < "$A_LOG" | grep -oE 'out of [0-9]+ total' | tail -1 | grep -oE '[0-9]+' || true)"
+        b_tot="$(tr -d '\n' < "$B_LOG" | grep -oE 'out of [0-9]+ total' | tail -1 | grep -oE '[0-9]+' || true)"
+        info "数据集规模自检： A out-of-total=${a_tot:-?}   B out-of-total=${b_tot:-?}"
+        if [[ -n "$a_tot" && -n "$b_tot" && "$a_tot" != "$b_tot" ]]; then
+            warn "两边 episode 总数解析不一致（$a_tot vs $b_tot）—— 请人工核对两条日志"
+        elif [[ -n "$a_tot" ]]; then
+            ok "两边数据集一致（$a_tot 条 episode）"
+        fi
+    fi
+
+    # ---------------------------------------------------------------- 对比
+    step "4. 结果对比（唯一变量 = codec）"
+    if [[ -f "$A_MET" && -f "$B_MET" ]]; then
+        set +e
+        python tools/eval_compare.py "$A_MET" "$B_MET" \
+            --label-a "A(微调 YAM codec)" --label-b "B(官方 codec)" || true
+        set -e
+    else
+        warn "缺少一侧 metrics，无法对比：A=$A_MET  B=$B_MET"
+    fi
+
+    # ---------------------------------------------------------------- 上传
+    if [[ "${EVAL_UPLOAD:-1}" == "1" && -f "$A_MET" ]]; then
+        step "5. 上传到 HF（独立目录，绝不覆盖 eval/A、eval/B）"
+        local repo="${HF_REPO_ID:-Zenith6666/yam-backbone}"
+        hf upload "$repo" "$A_MET" "eval/codecab/${ne}ep/A_codecYAM/metrics.json" \
+            --repo-type model >/dev/null 2>&1 \
+            && ok "已上传 eval/codecab/${ne}ep/A_codecYAM/metrics.json" || warn "A 上传失败"
+        if [[ -f "$B_MET" ]]; then
+            hf upload "$repo" "$B_MET" "eval/codecab/${ne}ep/B_codecOFFICIAL/metrics.json" \
+                --repo-type model >/dev/null 2>&1 \
+                && ok "已上传 eval/codecab/${ne}ep/B_codecOFFICIAL/metrics.json" || warn "B 上传失败"
+        fi
+    fi
+
+    cat <<EOF
+
+  ── codec-only 对比完成 ────────────────────────────────────────
+  唯一变量：codec（backbone / stats / 数据管线 全部相同）
+    A = 微调 YAM codec   $YAM_CODEC
+    B = 官方原版 codec   $OFF_CODEC
+
+  判读：
+    B 的 ar_action_l1 明显高于 A  → 微调 codec 有用 ✅
+    两者接近                     → codec 微调收益有限
+    A 反而更高                   → 微调 codec 有害，需查训练
+
+  日志：
+    A: $logd/eval_codec_A.log
+    B: $logd/eval_codec_B.log
+EOF
+}
+
 # ---------------------------------------------------------------- 分发
 # ⚠️ 必须把 start.sh 收到的额外参数透传给 do_train，否则
 #    `bash start.sh model.max_epochs=1` 会静默失效（用户以为 1 epoch，实际 10 epoch）。
@@ -1626,6 +1821,7 @@ case "$MODE" in
     setup)  do_setup ;;
     verify) do_verify ;;
     eval)   do_eval ;;
+    eval-codec) do_eval_codec ;;
     serve-check) do_serve_check ;;
     train)  do_train "$@" ;;
     all)
@@ -1633,7 +1829,7 @@ case "$MODE" in
         do_verify          # L3 不通过会在这里非零退出，不会带着坏权重去训练
         do_train "$@"
         ;;
-    *)      fail "未知 MODE=$MODE（可选 smoke | smoke-ddp | setup | verify | train | all）" ;;
+    *)      fail "未知 MODE=$MODE（可选 smoke | smoke-ddp | setup | verify | train | eval | eval-codec | serve-check | all）" ;;
 esac
 
 step "MODE=$MODE 结束"
