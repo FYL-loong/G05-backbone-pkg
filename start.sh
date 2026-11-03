@@ -1812,6 +1812,235 @@ do_eval_codec() {
 EOF
 }
 
+do_eval_matrix() {
+    # ================================================================
+    # 2×2 矩阵：{官方/我们 backbone} × {官方/YAM codec}
+    #
+    # 设计（每一行都用该 backbone 自己匹配的 dataset_stats.json）：
+    #   官方 backbone + 官方 codec   ← 官方原始发布版（匹配）
+    #   官方 backbone + YAM  codec   ← 错配（补齐这一格）
+    #   我们 backbone + 官方 codec   ← 错配
+    #   我们 backbone + YAM  codec   ← 我们部署的版本（匹配）
+    #
+    # 对角线 = 匹配（正确用法），反对角线 = 错配。
+    # 能回答：①codec 的收益是否依赖 backbone ②错配的代价有多大
+    #
+    # ⚠️ 不能用来"分解 backbone 贡献" —— stats 与 backbone 训练时耦合，
+    #    强行统一 stats 会不公平对待其中一边。backbone 的贡献只能在
+    #    系统级（原始发布版 vs 我们全套）里说。
+    #
+    # 产物：
+    #   eval_matrix/<tag>/metrics.json      （4 份，互不覆盖）
+    #   eval_logs/eval_matrix_<tag>.log
+    #   HF: eval/matrix/<N>ep/<tag>/metrics.json
+    # ================================================================
+    require_hf_token
+    activate_venv
+
+    local ne="${EVAL_EPISODES:-10}"
+    local YAM_CODEC="$PROJECT_ROOT/checkpoints/action_tokenizer_yam.pt"
+    local OFF_CODEC="$PROJECT_ROOT/checkpoints/action_tokenizer.pt"
+    local G05_BASE="$PROJECT_ROOT/checkpoints/g05-base"
+    local OFF_CKPT="$G05_BASE/checkpoints/model_state_dict.pt"
+    local logd="$PROJECT_ROOT/eval_logs"
+    local outdir="$PROJECT_ROOT/eval_matrix"
+    mkdir -p "$logd" "$outdir"
+
+    step "0. 前置检查（2×2 矩阵）"
+    [[ -x .venv/bin/python ]] || fail "没有 .venv —— 先跑 MODE=setup"
+    [[ -f "$YAM_CODEC" ]] || fail "缺少微调 codec $YAM_CODEC"
+    [[ -f "$OFF_CODEC" ]] || fail "缺少官方 codec $OFF_CODEC"
+    [[ -f "$OFF_CKPT"  ]] || fail "缺少官方 backbone $OFF_CKPT（先跑 MODE=setup）"
+    [[ -f "$G05_BASE/dataset_stats.json" ]] || fail "缺少官方 stats $G05_BASE/dataset_stats.json"
+
+    local yam_sz off_sz off_ck
+    yam_sz="$(stat -c%s "$YAM_CODEC" 2>/dev/null || echo 0)"
+    off_sz="$(stat -c%s "$OFF_CODEC" 2>/dev/null || echo 0)"
+    off_ck="$(stat -c%s "$OFF_CKPT" 2>/dev/null || echo 0)"
+    info "尺寸指纹："
+    info "  微调 codec   $yam_sz B  期望 169709565"
+    info "  官方 codec   $off_sz B  期望 506886775"
+    info "  官方 backbone $off_ck B  期望 11440519964"
+    [[ "$yam_sz" == "169709565"   ]] || fail "微调 codec 尺寸不符（$yam_sz）"
+    [[ "$off_sz" == "506886775"   ]] || fail "官方 codec 尺寸不符（$off_sz）"
+    [[ "$off_ck" == "11440519964" ]] || fail "官方 backbone 尺寸不符（$off_ck）"
+    ok "三个尺寸指纹都对"
+
+    prepare_yam_run_dir
+    local RUN="$PREPARED_RUN_DIR"
+    local OUR_CKPT="$PREPARED_CKPT"
+    ok "我们 backbone = $OUR_CKPT（stats: $RUN/dataset_stats.json）"
+    ok "官方 backbone = $OFF_CKPT（stats: $G05_BASE/dataset_stats.json）"
+
+    # ---- 单格评测
+    #   $1=tag   $2=ckpt   $3=task_config(空=用 run 目录自带配置)   $4=codec  $5=run_dir(用于找 metrics)
+    _cell() {
+        local tag="$1" ckpt="$2" tcfg="$3" codec="$4" rdir="$5"
+        local log="$logd/eval_matrix_${tag}.log"
+        local met dest="$outdir/$tag/metrics.json"
+        mkdir -p "$outdir/$tag"
+        rm -f "$log"
+        rm -rf "$rdir/eval_model_state_dict"
+
+        info "── 格子 $tag"
+        info "   ckpt  = $ckpt"
+        info "   codec = $codec"
+        info "   stats = $rdir/dataset_stats.json"
+        set +e
+        if [[ -n "$tcfg" ]]; then
+            bash scripts/run/eval_open_loop.sh \
+                --task_config "$tcfg" \
+                --ckpt_path "$ckpt" \
+                "eval_episodes_num=$ne" \
+                "tokenizer.vq_config.ckpt_dir=$codec" \
+                "model.tokenizer.vq_config.ckpt_dir=$codec" \
+                "model.model_arch.AT_CONFIG.ckpt_dir=$codec" \
+                2>&1 | tee "$log"
+        else
+            bash scripts/run/eval_open_loop.sh \
+                --ckpt_path "$ckpt" \
+                "eval_episodes_num=$ne" \
+                "tokenizer.vq_config.ckpt_dir=$codec" \
+                "model.tokenizer.vq_config.ckpt_dir=$codec" \
+                "model.model_arch.AT_CONFIG.ckpt_dir=$codec" \
+                2>&1 | tee "$log"
+        fi
+        local rc=${PIPESTATUS[0]}
+        set -e
+        if [[ $rc -ne 0 ]]; then
+            warn "$tag 评测失败（rc=$rc），日志 $log"
+            tail -30 "$log" 2>/dev/null || true
+            return 1
+        fi
+        # 自检：实际加载的 codec
+        local used want
+        used="$(tr -d '\n' < "$log" 2>/dev/null | grep -oE 'action_tokenizer[a-z_]*\.pt' | tail -1 || true)"
+        if [[ "$codec" == *"action_tokenizer_yam.pt" ]]; then want="action_tokenizer_yam.pt"; else want="action_tokenizer.pt"; fi
+        if [[ "$used" == "$want" ]]; then
+            ok "$tag 自检通过：加载 $used"
+        else
+            warn "★★ $tag 实际加载 [$used]，期望 [$want] —— 本格不可信"
+            return 1
+        fi
+        met="$(find "$rdir/eval_model_state_dict" -maxdepth 2 -name metrics.json -print -quit 2>/dev/null || true)"
+        if [[ -z "$met" || ! -f "$met" ]]; then
+            warn "$tag 没产出 metrics.json"
+            return 1
+        fi
+        cp -f "$met" "$dest"
+        ok "$tag 完成 → $dest"
+        return 0
+    }
+
+    local fail_n=0
+    step "1/4 官方 backbone + 官方 codec（原始发布版，匹配）"
+    _cell "official__officialcodec" "$OFF_CKPT" "configs/task/yam.yaml" "$OFF_CODEC" "$G05_BASE" || fail_n=$((fail_n+1))
+
+    step "2/4 官方 backbone + YAM codec（错配）★ 关键补充格"
+    _cell "official__yamcodec" "$OFF_CKPT" "configs/task/yam.yaml" "$YAM_CODEC" "$G05_BASE" || fail_n=$((fail_n+1))
+
+    step "3/4 我们 backbone + 官方 codec（错配）"
+    _cell "ours__officialcodec" "$OUR_CKPT" "" "$OFF_CODEC" "$RUN" || fail_n=$((fail_n+1))
+
+    step "4/4 我们 backbone + YAM codec（我们部署的版本，匹配）"
+    _cell "ours__yamcodec" "$OUR_CKPT" "" "$YAM_CODEC" "$RUN" || fail_n=$((fail_n+1))
+
+    step "5. 2×2 矩阵汇总"
+    if [[ $fail_n -gt 0 ]]; then
+        warn "有 $fail_n 个格子失败 —— 矩阵不完整，请看上面日志"
+    fi
+    set +e
+    python3 - "$outdir" <<'PYMATRIX'
+import json, os, sys
+root = sys.argv[1]
+tags = ['official__officialcodec', 'official__yamcodec',
+        'ours__officialcodec',     'ours__yamcodec']
+data = {}
+for t in tags:
+    p = os.path.join(root, t, 'metrics.json')
+    if os.path.isfile(p):
+        try:
+            data[t] = json.load(open(p, encoding='utf-8'))
+        except Exception as e:
+            print('  [WARN] %s 读取失败: %s' % (t, e))
+
+def g(t, k):
+    return data.get(t, {}).get(k)
+
+print()
+print('=' * 88)
+print('  2×2 矩阵：{官方/我们 backbone} × {官方/YAM codec}')
+print('  括号内 = 该 backbone 使用各自匹配的 dataset_stats.json')
+print('=' * 88)
+print('  %-34s %18s %18s' % ('ar_action_l1', '官方 codec', 'YAM codec'))
+for row, lbl in (('official', '官方 backbone (官方 stats)'),
+                 ('ours',     '我们 backbone (YAM stats)')):
+    cells = []
+    for col in ('officialcodec', 'yamcodec'):
+        v = g('%s__%s' % (row, col), 'rollout/ar_action_l1')
+        cells.append('%.6f' % v if isinstance(v, (int, float)) else '   --   ')
+    print('  %-34s %18s %18s' % (lbl, cells[0], cells[1]))
+print('-' * 88)
+print('  %-34s %18s %18s' % ('ar_action_token_acc', '官方 codec', 'YAM codec'))
+for row, lbl in (('official', '官方 backbone (官方 stats)'),
+                 ('ours',     '我们 backbone (YAM stats)')):
+    cells = []
+    for col in ('officialcodec', 'yamcodec'):
+        v = g('%s__%s' % (row, col), 'rollout/ar_action_token_acc')
+        cells.append('%.6f' % v if isinstance(v, (int, float)) else '   --   ')
+    print('  %-34s %18s %18s' % (lbl, cells[0], cells[1]))
+print('=' * 88)
+print('  对角线 = 匹配（正确用法）；反对角线 = 错配')
+print()
+
+# 错配代价
+for row, lbl in (('official', '官方 backbone'), ('ours', '我们 backbone')):
+    m = g(row + '__' + ('yamcodec' if row == 'ours' else 'officialcodec'), 'rollout/ar_action_l1')
+    x = g(row + '__' + ('officialcodec' if row == 'ours' else 'yamcodec'), 'rollout/ar_action_l1')
+    if isinstance(m, (int, float)) and isinstance(x, (int, float)) and m:
+        print('  %s：错配使 L1 变化 %+.1f%%（匹配 %.6f → 错配 %.6f）'
+              % (lbl, (x - m) / m * 100.0, m, x))
+# codec 效应（各自 backbone 内）
+for row, lbl in (('ours', '我们 backbone'), ('official', '官方 backbone')):
+    a = g(row + '__officialcodec', 'rollout/ar_action_l1')
+    b = g(row + '__yamcodec', 'rollout/ar_action_l1')
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)) and a:
+        print('  %s：换成 YAM codec 使 L1 %+.1f%%' % (lbl, (b - a) / a * 100.0))
+PYMATRIX
+    set -e
+
+    step "6. 上传到 HF（独立目录 eval/matrix/）"
+    if [[ "${EVAL_UPLOAD:-1}" == "1" ]]; then
+        local repo="${HF_REPO_ID:-Zenith6666/yam-backbone}"
+        local t
+        for t in official__officialcodec official__yamcodec ours__officialcodec ours__yamcodec; do
+            if [[ -f "$outdir/$t/metrics.json" ]]; then
+                hf upload "$repo" "$outdir/$t/metrics.json" \
+                    "eval/matrix/${ne}ep/$t/metrics.json" --repo-type model >/dev/null 2>&1 \
+                    && ok "已上传 eval/matrix/${ne}ep/$t/metrics.json" \
+                    || warn "$t 上传失败"
+            fi
+        done
+    fi
+
+    cat <<EOF
+
+  ── 2×2 矩阵完成 ──────────────────────────────────────────────
+  产物目录：$outdir/
+  日志    ：$logd/eval_matrix_*.log
+  每格耗时约 6~7 分钟（实测）
+
+  怎么读这张表：
+    对角线（匹配）  官方+官方 / 我们+YAM  = 各自正确用法
+    反对角线（错配）官方+YAM  / 我们+官方  = 拿错 codec 的代价
+    → 若两行的"错配代价"同号且量级相当：codec 必须与 backbone 配套，是普遍规律
+    → 若官方 backbone 换 YAM codec 反而变好：说明官方 codec 本身就差，与 backbone 无关
+
+  ⚠️ 别用这张表分解"backbone 贡献" —— 每行 stats 与 backbone 训练时耦合，
+     强行统一 stats 会不公平对待其中一边。
+EOF
+}
+
 # ---------------------------------------------------------------- 分发
 # ⚠️ 必须把 start.sh 收到的额外参数透传给 do_train，否则
 #    `bash start.sh model.max_epochs=1` 会静默失效（用户以为 1 epoch，实际 10 epoch）。
@@ -1822,6 +2051,7 @@ case "$MODE" in
     verify) do_verify ;;
     eval)   do_eval ;;
     eval-codec) do_eval_codec ;;
+    eval-matrix) do_eval_matrix ;;
     serve-check) do_serve_check ;;
     train)  do_train "$@" ;;
     all)
@@ -1829,7 +2059,7 @@ case "$MODE" in
         do_verify          # L3 不通过会在这里非零退出，不会带着坏权重去训练
         do_train "$@"
         ;;
-    *)      fail "未知 MODE=$MODE（可选 smoke | smoke-ddp | setup | verify | train | eval | eval-codec | serve-check | all）" ;;
+    *)      fail "未知 MODE=$MODE（可选 smoke | smoke-ddp | setup | verify | train | eval | eval-codec | eval-matrix | serve-check | all）" ;;
 esac
 
 step "MODE=$MODE 结束"
