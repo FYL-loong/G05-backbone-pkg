@@ -77,10 +77,24 @@ say "  ✓ vla_client.py 含 --cmd-lowpass-tau"
 
 # ── 2. 服务端 ────────────────────────────────────────────────────────────────
 head1 "2/5 服务端 (port $SERVER_PORT)"
-if ss -tln 2>/dev/null | grep -q ":${SERVER_PORT} "; then
+# 双重判据：ss 偶发返回空会把活着的服务端误判成没起（实测踩过），
+# 所以再补一条 /dev/tcp 直连探测；两者任一为真即认为在监听。
+server_listening() {
+    ss -tln 2>/dev/null | grep -q ":${SERVER_PORT} " && return 0
+    (exec 3<>"/dev/tcp/127.0.0.1/${SERVER_PORT}") 2>/dev/null && { exec 3>&- 2>/dev/null; return 0; }
+    return 1
+}
+up=0
+for _try in 1 2 3; do
+    if server_listening; then up=1; break; fi
+    [ "$_try" -lt 3 ] && { say "  ...没探测到，2s 后重试 ($_try/3)"; sleep 2; }
+done
+if [ "$up" = "1" ]; then
     say "  ✓ 已在监听"
 else
-    fail "服务端没在跑。先起 serve_policy.py（见 RUNBOOK），再重跑本脚本。"
+    fail "服务端没在跑（探测了 3 次）。当前端口状态："
+    ss -tln 2>/dev/null | grep -E ":${SERVER_PORT}|State" || true
+    say "  先起 serve_policy.py，再重跑本脚本。"
     exit 1
 fi
 
