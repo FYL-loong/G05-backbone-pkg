@@ -355,6 +355,35 @@ def rate_limit_target(target: np.ndarray, prev: np.ndarray, dt_s: float,
                 clip_arm = max(clip_arm, abs(d) - cap)
     return out.astype(np.float32), clip_grip, clip_arm
 
+def release_freeze_update(prev_t, target, opening_prev, step,
+                          freeze_until, freeze_steps,
+                          gripper_joints=GRIPPER_JOINTS):
+    """patch 26 的纯函数内核：判断是否要冻结手臂，并就地改 ``target`` 的臂维度。
+
+    返回 ``(freeze_until, frozen_now, opening_now, triggered)``。
+
+    抽成纯函数的意义：这段逻辑第一次写的时候用了 ``last["t"][GRIPPER_JOINTS]``，
+    而 ``GRIPPER_JOINTS`` 是 tuple ``(6, 13)`` —— numpy 会把 tuple 当成多维索引，
+    在真机上直接 IndexError（array is 1-dimensional, but 2 were indexed）。
+    纯函数 + 单元测试能在本地就把这种错拦住。
+
+    夹爪语义：1.0 = 闭合，0.0 = 张开。所以「张开」= 目标值变小。
+    """
+    if freeze_steps <= 0:
+        return freeze_until, False, False, False
+    gj = list(gripper_joints)          # ★ tuple 必须转 list，否则 ndarray[(6,13)] 报错
+    opening_now = bool(np.any((prev_t[gj] - target[gj]) > 1e-3))
+    # 边沿检测：只在「刚由不张开变成张开」那一步触发一次，
+    # 否则张开持续约 10 步会把冻结反复续期，手臂停太久。
+    triggered = bool(opening_now and not opening_prev and step > freeze_until)
+    if triggered:
+        freeze_until = step + freeze_steps
+    frozen_now = bool(step <= freeze_until)
+    if frozen_now:
+        target[ARM_JOINTS] = prev_t[ARM_JOINTS]
+    return freeze_until, frozen_now, opening_now, triggered
+
+
 def build_obs(state: np.ndarray, images: dict[str, np.ndarray],
               task: str, frequency: float) -> dict:
     """构造服务端 ``_validate_obs`` 期望的观测字典。"""
@@ -1055,19 +1084,15 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
         #       物块在手臂静止的条件下自然落进孔里，再放开让模型继续。
         frozen_now = False
         if release_freeze_steps > 0:
-            _g_prev = last["t"][GRIPPER_JOINTS]
-            _g_now = target[GRIPPER_JOINTS]
-            _opening = bool(np.any((_g_prev - _g_now) > 1e-3))   # 值变小 = 张开
-            # 边沿检测：只在「刚由不张开变成张开」的那一步触发一次，
-            # 否则张开持续 10 步会把冻结反复续期，手臂停太久。
-            if _opening and not grip_opening_prev and step > grip_freeze_until:
-                grip_freeze_until = step + release_freeze_steps
+            (grip_freeze_until, frozen_now, _opening,
+             _triggered) = release_freeze_update(
+                last["t"], target, grip_opening_prev, step,
+                grip_freeze_until, release_freeze_steps)
+            if _triggered:
                 logger.info("patch26：夹爪开始张开（step %d）→ 冻结手臂 %d 步"
                             "（%.2fs），让物块自然落下", step, release_freeze_steps,
                             release_freeze_steps / RATE)
-            if step <= grip_freeze_until:
-                target[ARM_JOINTS] = last["t"][ARM_JOINTS]
-                frozen_now = True
+            if frozen_now:
                 grip_frozen_steps += 1
             grip_opening_prev = _opening
 
