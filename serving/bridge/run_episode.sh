@@ -24,6 +24,9 @@ TASK_ID=${TASK_ID:-TASK-YAM-0006}
 DURATION=${DURATION:-40}           # 宽松上限；通常 --stop-when-still 会提前结束
 ARM_SPEED=${ARM_SPEED:-1.0}       # rad/s，57°/s。>1.5 会因 0.53s 延迟而震荡
 LP_TAU=${LP_TAU:-0.10}            # 命令低通时间常数，压高频抖动
+GRIP_CLOSE_RATE=${GRIP_CLOSE_RATE:-0.7}   # 夹爪【闭合】限速 /s（慢，防把物块夹飞）patch26
+GRIP_OPEN_RATE=${GRIP_OPEN_RATE:-3.0}     # 夹爪【张开】限速 /s（快，防释放时甩飞）patch26
+RELEASE_FREEZE=${RELEASE_FREEZE:-9}       # 张开后冻结手臂步数（9≈0.3s）patch26
 STILL=${STILL:-60}                # 模型输出连续多少步不变就正常结束（兜底，60=2秒）
 RELEASE_STOP=${RELEASE_STOP:-45}  # 夹爪释放后再跑多少步就停（45=1.5秒）——主结束条件
 HOME_SPEED=${HOME_SPEED:-0.12}    # 复位速度 rad/s，6.9°/s
@@ -56,6 +59,7 @@ say "  任务        : $TASK_ID"
 say "  时长上限    : ${DURATION}s（夹爪释放后 ${RELEASE_STOP} 步即停；兜底：连续 ${STILL} 步不动）"
 say "  臂限速      : ${ARM_SPEED} rad/s"
 say "  低通 tau    : ${LP_TAU}s"
+say "  夹爪限速    : 闭合 ${GRIP_CLOSE_RATE}/s  张开 ${GRIP_OPEN_RATE}/s  释放冻结 ${RELEASE_FREEZE} 步"
 say "  跑完复位    : $([ "$RESET" = "1" ] && echo "是 (${HOME_SPEED} rad/s)" || echo "否")"
 say "  日志        : $LOG"
 say "  CSV         : $CSV"
@@ -123,6 +127,8 @@ if [ "$DRY" = "1" ]; then
     say "      --task-id $TASK_ID --robot-backend zmq --command-timing legacy_30hz \\"
     say "      --camera-config \"$D/live_configs/robot.yaml\" \\"
     say "      --motion-src \"$D/code/motion/src\" \\"
+    say "      --gripper-rate-limit $GRIP_CLOSE_RATE --gripper-open-rate $GRIP_OPEN_RATE \\"
+    say "      --release-freeze-steps $RELEASE_FREEZE \\"
     say "      --arm-max-speed-rad-s $ARM_SPEED --cmd-lowpass-tau $LP_TAU \\"
     say "      --stop-after-release $RELEASE_STOP --stop-when-still $STILL \\"
     say "      --log-csv \"$CSV\" --duration $DURATION --verbose"
@@ -134,6 +140,9 @@ else
         --robot-backend zmq --command-timing legacy_30hz \
         --camera-config "$D/live_configs/robot.yaml" \
         --motion-src    "$D/code/motion/src" \
+        --gripper-rate-limit "$GRIP_CLOSE_RATE" \
+        --gripper-open-rate  "$GRIP_OPEN_RATE" \
+        --release-freeze-steps "$RELEASE_FREEZE" \
         --arm-max-speed-rad-s "$ARM_SPEED" \
         --cmd-lowpass-tau "$LP_TAU" \
         --stop-after-release "$RELEASE_STOP" \

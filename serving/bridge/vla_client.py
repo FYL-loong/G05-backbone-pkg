@@ -314,7 +314,8 @@ def lowpass_target(raw: np.ndarray, smoothed, dt_s: float,
 
 def rate_limit_target(target: np.ndarray, prev: np.ndarray, dt_s: float,
                       gripper_rate: float = GRIPPER_RATE_LIMIT_S,
-                      arm_speed: float = ARM_MAX_SPEED_RAD_S):
+                      arm_speed: float = ARM_MAX_SPEED_RAD_S,
+                      gripper_open_rate: float = -1.0):
     """按速度上限裁剪目标（patch 10）。返回 ``(new_target, clipped_grip, clipped_arm)``。
 
     为什么需要：模型输出的是**绝对目标**，夹爪维度可能一步之内 0→1。
@@ -333,10 +334,19 @@ def rate_limit_target(target: np.ndarray, prev: np.ndarray, dt_s: float,
     clip_grip = 0.0
     clip_arm = 0.0
     for j in range(out.shape[0]):
-        cap = (gripper_rate if j in GRIPPER_JOINTS else arm_speed) * dt_s
+        d = float(out[j] - prev[j])
+        if j in GRIPPER_JOINTS:
+            # patch 26：夹爪语义 1.0=闭 / 0.0=开，两个方向的需求相反 ——
+            #   d > 0（闭合）要慢：太快会"啪"一下把物块弹飞（patch 10 的初衷）
+            #   d < 0（张开）要快：太慢则手指还没离开物块、手臂已被命令抬走，
+            #                     物块被"甩"起来翻面（A03~A05 的同一失败模式）
+            rate = (gripper_rate if d >= 0
+                    else (gripper_open_rate if gripper_open_rate > 0 else gripper_rate))
+        else:
+            rate = arm_speed
+        cap = rate * dt_s
         if cap <= 0:
             continue
-        d = float(out[j] - prev[j])
         if abs(d) > cap:
             out[j] = prev[j] + np.sign(d) * cap
             if j in GRIPPER_JOINTS:
@@ -807,6 +817,7 @@ def _ws_connect(uri: str):
 async def _loop(ws, robot, cameras, task, steps, duration, limits,
                 jump_warn, max_step, latencies, t_run0, last,
                 gripper_rate=GRIPPER_RATE_LIMIT_S, arm_speed=ARM_MAX_SPEED_RAD_S,
+                gripper_open_rate=-1.0, release_freeze_steps=0,
                 cam_stall_abort=CAMERA_STALL_ABORT_S, csv_writer=None,
                 freeze_logger=None,
                 output_sanity_deg=OUTPUT_SANITY_DEG,
@@ -864,6 +875,11 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
     smoothed_steps = 0
     freeze_steps = 0          # 连续"几乎不动"的步数（patch 15 诊断）
     freeze_reports = 0
+    # patch 26：释放瞬间冻结手臂
+    grip_freeze_until = -1    # 冻结到第几步（-1 = 没在冻结）
+    grip_frozen_steps = 0     # 累计冻结步数
+    frozen_now = False        # 本步是否处于冻结（写进 CSV）
+    grip_opening_prev = False # 上一步夹爪是否在张开（边沿检测用）
 
     while True:
         if steps > 0 and step >= steps:
@@ -1015,7 +1031,8 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
         now_cmd = time.monotonic()
         target, clipped_grip, clipped_arm = rate_limit_target(
             target, last["t"], now_cmd - last_cmd_t,
-            gripper_rate=gripper_rate, arm_speed=arm_speed)
+            gripper_rate=gripper_rate, arm_speed=arm_speed,
+            gripper_open_rate=gripper_open_rate)
         if clipped_grip > 1e-6:
             grip_clip_steps += 1
             if grip_clip_steps <= 5 or grip_clip_steps % 30 == 0:
@@ -1029,6 +1046,30 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
                 logger.warning("臂限速生效：本步裁剪 %.1f°（第 %d 次）—— "
                                "这就是换段跳变，被限速平滑掉",
                                np.rad2deg(clipped_arm), arm_clip_steps)
+
+        # ── ★ patch 26：释放瞬间冻结手臂 ────────────────────────────────
+        # 现象：释放时物块被"甩"起来翻面（A03~A05 同一模式）。
+        # 机理：夹爪刚张开、物块还贴着手指，同一时刻模型仍在命令手臂运动
+        #       （换段跳变实测可达 20°，限速后仍有 57°/s），于是物块被手臂带走。
+        # 做法：检测到夹爪开始张开 → 接下来 N 步把臂目标钉在当前位置不动，
+        #       物块在手臂静止的条件下自然落进孔里，再放开让模型继续。
+        frozen_now = False
+        if release_freeze_steps > 0:
+            _g_prev = last["t"][GRIPPER_JOINTS]
+            _g_now = target[GRIPPER_JOINTS]
+            _opening = bool(np.any((_g_prev - _g_now) > 1e-3))   # 值变小 = 张开
+            # 边沿检测：只在「刚由不张开变成张开」的那一步触发一次，
+            # 否则张开持续 10 步会把冻结反复续期，手臂停太久。
+            if _opening and not grip_opening_prev and step > grip_freeze_until:
+                grip_freeze_until = step + release_freeze_steps
+                logger.info("patch26：夹爪开始张开（step %d）→ 冻结手臂 %d 步"
+                            "（%.2fs），让物块自然落下", step, release_freeze_steps,
+                            release_freeze_steps / RATE)
+            if step <= grip_freeze_until:
+                target[ARM_JOINTS] = last["t"][ARM_JOINTS]
+                frozen_now = True
+                grip_frozen_steps += 1
+            grip_opening_prev = _opening
 
         # 兼容旧的硬钳位参数（--max-joint-step-deg，默认关闭）
         if max_step > 0:
@@ -1160,6 +1201,7 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
                     "clip_grip": round(float(clipped_grip), 5),
                     "clip_arm": round(float(clipped_arm), 5),
                     "need_obs_next": bool(resp.get("need_obs", True)),
+                    "frozen": bool(frozen_now),
                     "lat_ms": round((t_got - t_req) * 1e3, 1),
                 }) + "\n")
             except Exception as exc:  # noqa: BLE001
@@ -1182,6 +1224,7 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
     return exit_code, step, behind, {
         "cam_misses": cam_misses_total,
         "gripper_clipped_steps": grip_clip_steps,
+        "gripper_frozen_steps": grip_frozen_steps,
         "arm_clipped_steps": arm_clip_steps,
         "freeze_reports": freeze_reports,
         "smoothed_steps": smoothed_steps,
@@ -1425,6 +1468,8 @@ async def run(args) -> int:
     loop_kw = dict(
         gripper_rate=float(args.gripper_rate_limit),
         arm_speed=float(args.arm_max_speed_rad_s),
+        gripper_open_rate=float(getattr(args, "gripper_open_rate", -1.0)),
+        release_freeze_steps=int(getattr(args, "release_freeze_steps", 0)),
         cam_stall_abort=float(args.camera_stall_abort_s),
         csv_writer=csv_fh,
         freeze_logger=freeze_logger,
@@ -1434,8 +1479,13 @@ async def run(args) -> int:
         stop_still_steps=int(args.stop_when_still),
         stop_after_release=int(args.stop_after_release),
     )
-    logger.info("执行层配置：夹爪限速 %.2f/s，臂限速 %.2f rad/s，相机停顿阈值 %.1fs",
-                loop_kw["gripper_rate"], loop_kw["arm_speed"], loop_kw["cam_stall_abort"])
+    logger.info("执行层配置：夹爪限速 闭合 %.2f/s / 张开 %s，臂限速 %.2f rad/s，"
+                "相机停顿阈值 %.1fs，释放冻结 %d 步",
+                loop_kw["gripper_rate"],
+                ("关闭" if loop_kw["gripper_open_rate"] <= 0
+                 else "%.2f/s" % loop_kw["gripper_open_rate"]),
+                loop_kw["arm_speed"], loop_kw["cam_stall_abort"],
+                loop_kw["release_freeze_steps"])
 
     last = {"t": np.asarray(
         robot.get_observations()["joint_positions"], dtype=np.float32).reshape(-1)}
@@ -1507,6 +1557,10 @@ async def run(args) -> int:
                         stats.get("gripper_clipped_steps", 0),
                         stats.get("arm_clipped_steps", 0),
                         stats.get("freeze_reports", 0))
+            if stats.get("gripper_frozen_steps", 0):
+                logger.info("patch26：释放冻结生效 %d 步（%.2fs）",
+                            stats["gripper_frozen_steps"],
+                            stats["gripper_frozen_steps"] / RATE)
             if stats.get("arm_clipped_steps", 0):
                 logger.warning("臂限速生效了 %d 步 —— 说明换段确实有跳变，"
                                "已被平滑；若仍觉动作生硬可调小 --arm-max-speed-rad-s",
@@ -1595,6 +1649,13 @@ def main():
     ap.add_argument("--gripper-rate-limit", type=float, default=GRIPPER_RATE_LIMIT_S,
                     help="夹爪限速（单位/秒）。0.7 表示 0→1 需 1.43 s，"
                          "对齐 yam_motion 的 gripper_rate_limit；0 = 关闭（易把物体夹飞）")
+    ap.add_argument("--gripper-open-rate", type=float, default=-1.0,
+                    help="夹爪【张开】方向限速（/s）。默认 -1 = 与闭合同速（旧行为）。"
+                         "建议 3.0：张开要快，否则手指还没离开物块、手臂已被命令抬走，"
+                         "物块会被甩飞翻面（patch 26）")
+    ap.add_argument("--release-freeze-steps", type=int, default=0,
+                    help="检测到夹爪开始张开后，把手臂目标冻结这么多步（30Hz，9≈0.3s）。"
+                         "默认 0=关。建议 9：让物块在手臂静止时自然落进孔里（patch 26）")
     ap.add_argument("--arm-max-speed-rad-s", type=float, default=ARM_MAX_SPEED_RAD_S,
                     help="臂关节速度上限（rad/s）。默认 2.5（≈143°/s），"
                          "只裁剪换段尖峰、不干扰正常跟随；0 = 关闭")
