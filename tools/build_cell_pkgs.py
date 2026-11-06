@@ -206,9 +206,17 @@ def main():
             try:
                 if os.path.lexists(tgt):
                     os.remove(tgt)
-                os.link(srcht, tgt)
+                try:
+                    os.link(srcht, tgt)
+                except OSError as e:
+                    # 跨文件系统时硬链接不允许 → 退化为复制（会额外占盘，但不失败）
+                    print('      ⚠ %s 硬链接失败（跨文件系统？）→ 退化为复制'
+                          % os.path.basename(tgt))
+                    shutil.copy2(srcht, tgt)
+                    if e.errno not in (18,):        # EXDEV
+                        print('        (原因: %s)' % e)
             except Exception as e:
-                print('      ✗ 链接失败 %s: %s' % (os.path.basename(tgt), e))
+                print('      ✗ 处理失败 %s: %s' % (os.path.basename(tgt), e))
                 okall = False
         if not okall:
             continue
