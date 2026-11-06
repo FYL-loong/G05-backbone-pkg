@@ -336,12 +336,17 @@ def rate_limit_target(target: np.ndarray, prev: np.ndarray, dt_s: float,
     for j in range(out.shape[0]):
         d = float(out[j] - prev[j])
         if j in GRIPPER_JOINTS:
-            # patch 26：夹爪语义 1.0=闭 / 0.0=开，两个方向的需求相反 ——
-            #   d > 0（闭合）要慢：太快会"啪"一下把物块弹飞（patch 10 的初衷）
-            #   d < 0（张开）要快：太慢则手指还没离开物块、手臂已被命令抬走，
+            # patch 26：夹爪真实语义是 1.0 = 张开 / 0.0 = 闭合
+            #   （home_robot.py 复位时"张开到 [1. 1.]"；CSV 实测 0.998→0.030 是闭合过程）
+            # 两个方向的需求相反：
+            #   d > 0（张开）要快：太慢则手指还没离开物块、手臂已被命令抬走，
             #                     物块被"甩"起来翻面（A03~A05 的同一失败模式）
-            rate = (gripper_rate if d >= 0
-                    else (gripper_open_rate if gripper_open_rate > 0 else gripper_rate))
+            #   d < 0（闭合）要慢：太快会"啪"一下夹死/把物块弹飞（patch 10 的初衷）
+            # ⚠️ 第一版写反了（把 d>0 当闭合），导致闭合提速 4.3 倍、直接夹不住。
+            if d >= 0:      # 值变大 = 张开
+                rate = gripper_open_rate if gripper_open_rate > 0 else gripper_rate
+            else:           # 值变小 = 闭合
+                rate = gripper_rate
         else:
             rate = arm_speed
         cap = rate * dt_s
@@ -367,12 +372,12 @@ def release_freeze_update(prev_t, target, opening_prev, step,
     在真机上直接 IndexError（array is 1-dimensional, but 2 were indexed）。
     纯函数 + 单元测试能在本地就把这种错拦住。
 
-    夹爪语义：1.0 = 闭合，0.0 = 张开。所以「张开」= 目标值变小。
+    夹爪语义：1.0 = 张开，0.0 = 闭合。所以「张开」= 目标值变大。
     """
     if freeze_steps <= 0:
         return freeze_until, False, False, False
     gj = list(gripper_joints)          # ★ tuple 必须转 list，否则 ndarray[(6,13)] 报错
-    opening_now = bool(np.any((prev_t[gj] - target[gj]) > 1e-3))
+    opening_now = bool(np.any((target[gj] - prev_t[gj]) > 1e-3))
     # 边沿检测：只在「刚由不张开变成张开」那一步触发一次，
     # 否则张开持续约 10 步会把冻结反复续期，手臂停太久。
     triggered = bool(opening_now and not opening_prev and step > freeze_until)
@@ -1080,6 +1085,7 @@ async def _loop(ws, robot, cameras, task, steps, duration, limits,
         # 现象：释放时物块被"甩"起来翻面（A03~A05 同一模式）。
         # 机理：夹爪刚张开、物块还贴着手指，同一时刻模型仍在命令手臂运动
         #       （换段跳变实测可达 20°，限速后仍有 57°/s），于是物块被手臂带走。
+        # 注意夹爪语义：1.0 = 张开，0.0 = 闭合（此前写反过一次，导致闭合提速夹不住）。
         # 做法：检测到夹爪开始张开 → 接下来 N 步把臂目标钉在当前位置不动，
         #       物块在手臂静止的条件下自然落进孔里，再放开让模型继续。
         frozen_now = False
