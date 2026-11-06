@@ -72,7 +72,7 @@ for f in vla_client.py home_robot.py; do
     if [ -f "$B/$f" ]; then say "  ✓ $f"; else fail "缺文件: $B/$f"; rc=1; fi
 done
 # 关键参数是否存在于当前 vla_client.py（防止拖着旧文件白跑一轮）
-if ! "$V311" "$B/vla_client.py" --help 2>/dev/null | grep -q "cmd-lowpass-tau"; then
+if ! "$V311" "$B/vla_client.py" --help 2>/dev/null | grep -c "cmd-lowpass-tau" >/dev/null; then
     fail "vla_client.py 是旧版（没有 --cmd-lowpass-tau），请先拖新文件（md5 25038294814fac6cdd6296ca3c257366）"
     rc=1
 fi
@@ -84,7 +84,9 @@ head1 "2/5 服务端 (port $SERVER_PORT)"
 # 双重判据：ss 偶发返回空会把活着的服务端误判成没起（实测踩过），
 # 所以再补一条 /dev/tcp 直连探测；两者任一为真即认为在监听。
 server_listening() {
-    ss -tln 2>/dev/null | grep -q ":${SERVER_PORT} " && return 0
+    # 用 grep -c ... >/dev/null 而不是 grep -q：后者匹配即退出，上游 ss 会吃 SIGPIPE，
+    # 在 set -o pipefail 下整条流水线返回非零 → 活着的服务端被误判成没起（实测踩过两次）。
+    ss -tln 2>/dev/null | grep -c ":${SERVER_PORT} " >/dev/null && return 0
     (exec 3<>"/dev/tcp/127.0.0.1/${SERVER_PORT}") 2>/dev/null && { exec 3>&- 2>/dev/null; return 0; }
     return 1
 }
@@ -113,7 +115,7 @@ if [ $CHK_RC -ne 0 ]; then
     say "如果刚跑过一轮，等 2 秒再试（守护进程需约 1s 判定心跳失效）。"
     exit $CHK_RC
 fi
-if printf '%s' "$CHK" | grep -q "❌"; then
+if printf '%s' "$CHK" | grep -c "❌" >/dev/null; then
     fail "预检输出里有 ❌，退出。"
     exit 6
 fi
